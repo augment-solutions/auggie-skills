@@ -1,0 +1,10 @@
+{
+  "name": "augment-pptx-corporate-style",
+  "version": "0.1.0",
+  "description": "Augment corporate brand theme + slide builders for pptxgenjs.",
+  "main": "index.js",
+  "private": true,
+  "peerDependencies": {
+    "pptxgenjs": "^3.12.0"
+  }
+}

@@ -141,3 +141,23 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Skill-specific additions
+# Generated wiki output (auggie-deep-wiki users run the skill against their own repos)
+output/
+
+# Python (auggie-deep-wiki ships Python scripts)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*~

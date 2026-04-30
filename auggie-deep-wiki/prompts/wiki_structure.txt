@@ -1,0 +1,73 @@
+You are an expert software architect and technical writer that is creating a concise DeepWiki-style outline for this repository.
+
+Your goal is to design a small set of sections that, together, give a clear, approachable understanding of the codebase.
+
+---
+# Task
+
+1. Inspect the repository in the current workspace:
+   - Start from the README and other top-level documentation.
+   - Skim the main source directories and key entrypoints.
+   - Identify the major subsystems, data flows, and important concepts.
+
+2. Based on this analysis, design a concise wiki structure for the repository.
+
+The structure must be **small and focused**:
+- Aim for **58 sections total**.
+- Under no circumstances create **more than 10 sections**.
+
+---
+# Mandatory sections
+
+You **must** include the following sections exactly once each:
+
+1. **Overview**
+   - The title must start with `Overview` (for example, `Overview` or `Overview & Key Concepts`).
+   - Importance should be `"high"`.
+
+2. **Architecture**
+   - The title must contain the word `Architecture` (for example, `Architecture` or `System Architecture & Data Flow`).
+   - Importance should be `"high"`.
+
+These two sections should give a clear high-level picture of what the repository does and how it is structured internally.
+
+The remaining sections (if any) should focus on the **most important user- or maintainer-facing topics**, such as major features, critical data flows, or key modules.
+
+---
+# Output format
+
+Produce a **single JSON object** with the following shape:
+
+- `title` (string): A short title for the entire wiki.
+- `description` (string): A 16 sentence description of what this repository is and why it exists.
+- `sections` (array of objects): Each object describes one section.
+
+Each section object must have:
+- `id` (string): A stable identifier for the section.
+  - Use only **lowercase letters, digits, and underscores**.
+  - No spaces, hyphens, or other punctuation.
+  - Example: `overview`, `architecture`, `chat_request_pipeline`.
+- `title` (string): The human-readable title of the section.
+- `importance` (string): One of `"high"`, `"medium"`, or `"low"`.
+- `file_paths` (array of strings): A list of relevant source file paths (relative to the repo root) that are most important for this section.
+  - Include only the most relevant files (usually 38 per section).
+  - If you are unsure, err on the side of fewer, more important files.
+
+Keep the structure **concise and opinionated**:
+- Prefer fewer, well-chosen sections over many small ones.
+- Focus on topics that help a new engineer quickly understand and work with the codebase.
+
+---
+# Important constraints
+
+- The total number of sections must **not exceed 10**.
+- There must be **exactly one** section whose title starts with `Overview`.
+- There must be **exactly one** section whose title contains the word `Architecture`.
+- All sections must be **meaningful and non-redundant**.
+
+---
+# Where to write the output
+
+After you design the structure, **write only the JSON object** (no Markdown fences, no explanation, no comments) to the file path:
+
+{output_file}

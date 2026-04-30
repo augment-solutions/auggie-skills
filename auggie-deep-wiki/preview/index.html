@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Deep Wiki Preview</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
+<script>
+  // Apply the saved or system-preferred theme before paint to avoid FOUC.
+  (function () {
+    try {
+      var saved = localStorage.getItem("deep-wiki-theme");
+      var systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      var theme = saved || (systemDark ? "dark" : "light");
+      document.documentElement.setAttribute("data-theme", theme);
+    } catch (e) {
+      document.documentElement.setAttribute("data-theme", "light");
+    }
+  })();
+</script>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1f2328; --muted: #57606a;
+    --border: #d1d9e0; --code-bg: #f6f8fa; --link: #0969da;
+    --sidebar-bg: #f6f8fa; --error-bg: #ffebe9;
+  }
+  [data-theme="dark"] {
+    --bg: #0d1117; --fg: #e6edf3; --muted: #8b949e;
+    --border: #30363d; --code-bg: #161b22; --link: #58a6ff;
+    --sidebar-bg: #010409; --error-bg: #2d1418;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    line-height: 1.55;
+  }
+  .layout { display: grid; grid-template-columns: 280px 1fr; min-height: 100vh; }
+  aside.toc {
+    position: sticky; top: 0; align-self: start; height: 100vh;
+    overflow: auto; padding: 24px 16px;
+    background: var(--sidebar-bg); border-right: 1px solid var(--border);
+    font-size: 13px;
+  }
+  aside.toc .toc-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin: 0 0 12px;
+  }
+  aside.toc h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); margin: 0;
+  }
+  button#theme-toggle {
+    background: transparent; border: 1px solid var(--border);
+    color: var(--fg); border-radius: 4px; padding: 4px 8px;
+    font-size: 14px; cursor: pointer; line-height: 1;
+  }
+  button#theme-toggle:hover { background: var(--code-bg); }
+  button#theme-toggle .icon-dark { display: none; }
+  [data-theme="dark"] button#theme-toggle .icon-light { display: none; }
+  [data-theme="dark"] button#theme-toggle .icon-dark { display: inline; }
+  aside.toc ol { list-style: none; padding: 0; margin: 0; }
+  aside.toc a {
+    display: block; padding: 4px 8px; color: var(--fg);
+    text-decoration: none; border-radius: 4px;
+  }
+  aside.toc a:hover { background: var(--code-bg); }
+  aside.toc a.h3 { padding-left: 24px; color: var(--muted); font-size: 12px; }
+  main { padding: 32px 48px; max-width: 920px; }
+  h1, h2, h3 { font-weight: 600; line-height: 1.25; }
+  h1 { font-size: 2em; border-bottom: 1px solid var(--border); padding-bottom: 0.3em; }
+  h2 { font-size: 1.5em; margin-top: 1.6em; border-bottom: 1px solid var(--border); padding-bottom: 0.3em; }
+  h3 { font-size: 1.2em; margin-top: 1.4em; }
+  a { color: var(--link); }
+  code:not(pre code) {
+    background: var(--code-bg); padding: 0.2em 0.4em; border-radius: 4px;
+    font-size: 85%; font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+  pre {
+    background: var(--code-bg); padding: 16px; border-radius: 6px; overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: 85%;
+  }
+  pre code { background: transparent; padding: 0; }
+  .mermaid {
+    background: var(--code-bg); padding: 16px; border-radius: 6px;
+    text-align: center; overflow: auto;
+  }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2em 0; }
+  details {
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 12px; margin: 8px 0;
+  }
+  summary { cursor: pointer; font-weight: 500; }
+  blockquote {
+    border-left: 4px solid var(--border); margin: 0; padding: 0 1em;
+    color: var(--muted);
+  }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+  th, td { border: 1px solid var(--border); padding: 6px 12px; text-align: left; }
+  th { background: var(--code-bg); }
+  .loading { padding: 48px; color: var(--muted); }
+  .error { padding: 16px; color: #d1242f; background: var(--error-bg); border-radius: 6px; }
+  @media (max-width: 768px) {
+    .layout { grid-template-columns: 1fr; }
+    aside.toc { position: static; height: auto; max-height: 280px; }
+    main { padding: 16px 20px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-header">
+      <h2>Contents</h2>
+      <button id="theme-toggle" type="button" title="Toggle light/dark theme" aria-label="Toggle theme">
+        <span class="icon-light">☀</span><span class="icon-dark">☾</span>
+      </button>
+    </div>
+    <ol id="toc"></ol>
+  </aside>
+  <main id="content"><div class="loading">Loading wiki.mdx&hellip;</div></main>
+</div>
+<!-- build_static.py replaces the contents of this tag with the wiki.mdx body. -->
+<script id="wiki-source" type="text/markdown"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+
+  const currentTheme = () => document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "default";
+  const initMermaid = () => mermaid.initialize({ startOnLoad: false, theme: currentTheme(), securityLevel: "loose" });
+  initMermaid();
+
+  // Track rendered mermaid blocks so we can re-render on theme changes.
+  const mermaidBlocks = [];
+  let renderToken = 0;
+
+  async function renderMermaid() {
+    const token = ++renderToken;
+    initMermaid();
+    for (const { id, code } of mermaidBlocks) {
+      if (token !== renderToken) return; // a newer render superseded us
+      const el = document.getElementById(id);
+      if (!el) continue;
+      try {
+        // Unique svg id per render avoids mermaid's internal cache collisions.
+        const { svg } = await mermaid.render(id + "-svg-" + token, code);
+        el.innerHTML = svg;
+      } catch (e) {
+        el.innerHTML = '<pre>' + escapeHtml(code) + '</pre><div class="error">Mermaid render error: ' + escapeHtml(e.message || String(e)) + "</div>";
+      }
+    }
+  }
+
+  // Wire up the theme toggle button. Persists explicit user choice.
+  const toggleBtn = document.getElementById("theme-toggle");
+  if (toggleBtn) {
+    toggleBtn.addEventListener("click", () => {
+      const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", next);
+      try { localStorage.setItem("deep-wiki-theme", next); } catch (_) {}
+      renderMermaid();
+    });
+  }
+
+  // Follow system theme changes only when the user hasn't picked one explicitly.
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+    let saved = null;
+    try { saved = localStorage.getItem("deep-wiki-theme"); } catch (_) {}
+    if (saved) return;
+    document.documentElement.setAttribute("data-theme", e.matches ? "dark" : "light");
+    renderMermaid();
+  });
+
+  const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+  const slug = (s) => s.toLowerCase().replace(/[^\w\s-]/g, "").trim().replace(/\s+/g, "-");
+
+  async function load() {
+    const content = document.getElementById("content");
+    let raw;
+    const inline = document.getElementById("wiki-source");
+    const inlineText = inline ? inline.textContent.trim() : "";
+    if (inlineText) {
+      raw = inline.textContent;
+    } else {
+      try {
+        const resp = await fetch("wiki.mdx", { cache: "no-store" });
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        raw = await resp.text();
+      } catch (e) {
+        const isFile = location.protocol === "file:";
+        const hint = isFile
+          ? " (opening from file:// blocks fetch \u2014 run build_static.py to inline the wiki, or use scripts/preview.py)"
+          : "";
+        content.innerHTML = '<div class="error">Failed to load wiki.mdx: ' + escapeHtml(e.message) + escapeHtml(hint) + "</div>";
+        return;
+      }
+    }
+
+    const renderer = new marked.Renderer();
+    let mermaidIdx = 0;
+    renderer.code = function (code, lang) {
+      if ((lang || "").toLowerCase() === "mermaid") {
+        const id = "mermaid-" + (mermaidIdx++);
+        mermaidBlocks.push({ id, code });
+        return '<div class="mermaid" id="' + id + '"></div>';
+      }
+      return '<pre><code class="language-' + escapeHtml(lang || "") + '">' + escapeHtml(code) + "</code></pre>";
+    };
+    const used = new Map();
+    renderer.heading = function (text, level) {
+      const plain = text.replace(/<[^>]+>/g, "");
+      let id = slug(plain) || "section";
+      if (used.has(id)) { const n = used.get(id) + 1; used.set(id, n); id = id + "-" + n; }
+      else { used.set(id, 0); }
+      return "<h" + level + ' id="' + id + '">' + text + "</h" + level + ">";
+    };
+
+    marked.setOptions({ gfm: true, breaks: false, renderer });
+    content.innerHTML = marked.parse(raw);
+
+    await renderMermaid();
+
+    const toc = document.getElementById("toc");
+    const headings = content.querySelectorAll("h2, h3");
+    headings.forEach((h) => {
+      const li = document.createElement("li");
+      const a = document.createElement("a");
+      a.href = "#" + h.id;
+      a.textContent = h.textContent;
+      a.className = h.tagName.toLowerCase() === "h3" ? "h3" : "";
+      li.appendChild(a);
+      toc.appendChild(li);
+    });
+
+    if (location.hash) {
+      const t = document.querySelector(location.hash);
+      if (t) t.scrollIntoView();
+    }
+    document.title = (content.querySelector("h1")?.textContent || "Deep Wiki") + " — Preview";
+  }
+
+  load();
+</script>
+</body>
+</html>

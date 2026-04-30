@@ -1,0 +1,16 @@
+{
+  "name": "auggie-deep-wiki",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Optional Node deps for the auggie-deep-wiki Augment skill (MDX validator). Run `npm install` in this directory to enable scripts/validate_mdx.mjs.",
+  "type": "module",
+  "scripts": {
+    "validate": "node scripts/validate_mdx.mjs"
+  },
+  "dependencies": {
+    "@mdx-js/mdx": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

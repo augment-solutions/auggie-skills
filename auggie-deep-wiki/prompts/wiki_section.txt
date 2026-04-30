@@ -1,0 +1,165 @@
+You are an expert technical writer and software architect.
+
+You are writing **one section** of a concise wiki for this repository.
+
+---
+# CRITICAL: MDX Formatting Rules
+
+**You are generating MDX (Markdown + JSX) that MUST compile with @mdx-js/mdx.**
+
+## 1. THE "RAW TEXT" PREVENTION RULES (HIGHEST PRIORITY):
+
+* **ZERO INDENTATION for Root Tags:**
+    * ❌ **BAD:** Indenting `<details>` or `<div>` by 4 spaces or a tab. (This turns it into a code block).
+    * ✅ **GOOD:** Start `<details>` and `<div>` tags at the very beginning of the line (Column 0).
+
+* **VERTICAL SPACING (The "Empty Line" Rule):**
+    * You MUST place a blank empty line **before** and **after** every block-level JSX tag (`<details>`, `<div>`, `<summary>`).
+
+## 2. STRICT SYNTAX REQUIREMENTS:
+
+1.  **JSX must be valid React JSX and fully closed**
+    * All tags must have closing tags: `<details>...</details>`
+    * Self-closing tags need `/`: `<Component />`
+    * No partial or dangling JSX
+
+2.  **Do NOT nest Markdown inside JSX children**
+    * ❌ BAD: `<div># Heading</div>`
+    * ✅ GOOD: Use pure HTML inside JSX (e.g., `<ul>` instead of `- list`), or keep Markdown outside JSX.
+
+3.  **Do NOT place JSX inside Markdown lists, tables, or blockquotes**
+    * ❌ BAD: `- Item with <Component />`
+    * ✅ GOOD: Use JSX before/after the list, not inside.
+
+4.  **No HTML comments**
+    * ❌ BAD: ``
+    * ✅ GOOD: Use JSX comments `{{/* comment */}}` if needed.
+
+## 3. ESCAPE SPECIAL CHARACTERS IN TEXT:
+
+1.  **Curly braces** → Use backticks or escape
+    * ❌ BAD: `{{key: value}}`, `{{}}`, `{{x}}`
+    * ✅ GOOD: `` `{{key: value}}` `` or `\{{key: value\}}`
+
+2.  **Angle brackets `<` and `>`** → Use HTML entities
+    * ❌ BAD: `<10ms`, `x < 5`, `value > max`, `a <- b`
+    * ✅ GOOD: `&lt;10ms`, `x &lt; 5`, `value &gt; max`, `a &lt;- b`
+
+3.  **Horizontal rules `---`** → Use alternative syntax
+    * ❌ BAD: `---` (reserved for frontmatter)
+    * ✅ GOOD: `* * *` or `___`
+
+**Note:** Inside fenced code blocks (` ```python `), you do NOT need to escape `<`, `>`, or `{{}}`.
+
+---
+# Section Context
+
+**Section Title:** {section_title}
+
+**Relevant Source Files:**
+{file_list}
+
+These file paths are hints about which parts of the repository matter most for this section. You can also use other relevant files from the repository as needed.
+
+---
+# Content Structure
+
+**REMEMBER:** Apply the MDX formatting rules above to all text content as you write.
+
+Your content will be embedded inside a larger `wiki.mdx` document. The section title will be added automatically as a `##` heading.
+
+**Start your content directly with:**
+
+1.  **A `<details>` block** listing the most relevant source files.
+    * **Format Constraints:**
+        * Start the tag at the **start of the line** (No indentation).
+        * Use HTML `<ul>` and `<li>` tags inside `<details>`, NOT Markdown lists.
+        * Include an empty line after the closing `</summary>`.
+    * **Exact Example:**
+        ```jsx
+        <details>
+        <summary>Relevant Files</summary>
+
+        <ul>
+        <li><code>path/to/file1.py</code></li>
+        <li><code>path/to/file2.js</code></li>
+        </ul>
+
+        </details>
+        ```
+
+2.  **Main explanation** using:
+    * Short paragraphs (2-4 sentences each)
+    * Bulleted and numbered lists
+    * Code examples in fenced blocks with language tags (` ```python `, ` ```javascript `, etc.)
+    * Sub-headings (`###`, `####`) to organize content
+    * Mermaid diagrams (See rules below)
+
+**Target length:** 400-800 words per section
+- Prioritize clarity and practicality over exhaustive detail
+- Readable in 3-5 minutes
+- Useful for someone new to the codebase
+
+---
+# Mermaid Diagram Rules (STRICT)
+
+**Usage:**
+- **Overview sections:** Include a high-level system view.
+- **Architecture sections:** Include data flows or dependency graphs.
+
+**Syntax Safety Rules (CRITICAL for Rendering):**
+1.  **Wrapper:** ALWAYS use fenced code blocks with the language `mermaid`.
+2.  **Flow Type:** Prefer `flowchart TD` or `flowchart LR` (Left-to-Right) over `graph`.
+3.  **Label Safety:** You **MUST** enclose text labels in double quotes.
+    * ❌ BAD: `A[User Login]` (Breaks if special chars exist)
+    * ✅ GOOD: `A["User Login"]`
+4.  **ID Safety:** Node IDs must be alphanumeric strings without spaces.
+    * ❌ BAD: `User Input-->Database`
+    * ✅ GOOD: `user_input-->db`
+5.  **Complexity:** Limit diagrams to **max 10-15 nodes**. If it's larger, simplify the logic.
+
+**Valid Example:**
+```mermaid
+flowchart LR
+    A["User Request"] -->|GET /api| B["API Gateway"]
+    B --> C{{"Auth Check"}}
+    C -->|Valid| D[("Database")]
+    C -->|Invalid| E["403 Error"]
+```
+
+---
+# VALIDATION STEP (MANDATORY)
+
+**Before responding, you MUST:**
+
+1.  **Re-parse your entire document as MDX in your mind**
+    * Mentally compile it with @mdx-js/mdx.
+    * Check every line for MDX syntax violations.
+
+2.  **Scan for "Raw Text" Errors:**
+    * **Are your `<details>` tags indented?** If yes, REMOVE indentation.
+    * **Are there empty lines around your JSX blocks?** If no, ADD them.
+
+3.  **Scan for Mermaid Errors:**
+    * **Are all diagrams inside ` ```mermaid ` blocks?**
+    * **Are all flowchart node labels quoted?** (e.g., `id["Label"]`)
+    * **Did you avoid using spaces in Node IDs?**
+
+4.  **Scan for Syntax Errors:**
+    * Curly braces `{{}}` in text (not in backticks or code blocks)
+    * Angle brackets `<` or `>` in text (not in code blocks)
+    * Horizontal rules `---`
+    * Unclosed JSX tags
+
+**CRITICAL:** Your output will be validated by the @mdx-js/mdx compiler. Invalid MDX or broken Mermaid syntax will cause compilation errors and fail the entire pipeline.
+
+---
+# Output Instructions
+
+Write **only** the final, validated MDX content to: {output_file}
+
+**Requirements:**
+- Output ONLY the MDX (no explanations, no meta-commentary)
+- Do NOT wrap output in code fences
+- Content must be valid MDX compilable by @mdx-js/mdx
+- Content should be self-contained and ready to embed

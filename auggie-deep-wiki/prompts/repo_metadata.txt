@@ -1,0 +1,33 @@
+Extract repository metadata and save it as a JSON file.
+
+Please analyze this repository and create a JSON file with the following information:
+
+1. **name**: The name of the repository (e.g., "flask" from "pallets/flask")
+2. **owner**: The owner/organization name (e.g., "pallets" from "pallets/flask")
+3. **description**: A comprehensive description of what the repository does and its key features
+4. **primary_language**: Main programming language used
+5. **topics**: Key topics/tags associated with the repository (array of strings)
+
+Additional metadata to include if available:
+- **full_name**: Full repository name (e.g., "pallets/flask")
+
+Note: Star count and creation date will be fetched automatically from GitHub API, and commit information (hash, date) will be extracted from the cloned repository, so you don't need to include them.
+
+Format the output as clean JSON and save it to: {output_file}
+
+Example output format:
+```json
+{{
+  "name": "flask",
+  "owner": "pallets",
+  "full_name": "pallets/flask",
+  "description": "A lightweight WSGI web application framework for Python that provides tools, libraries, and patterns for building web applications",
+  "primary_language": "Python",
+  "topics": ["python", "web-framework", "wsgi", "flask", "microframework"]
+}}
+```
+
+Important:
+- Save ONLY the JSON content to the file, no markdown code blocks or explanations
+- Focus on providing a detailed, accurate description based on the codebase
+- Include relevant topics that describe the project's domain and technologies
