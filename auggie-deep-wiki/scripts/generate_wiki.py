@@ -554,6 +554,40 @@ def build_static_optional(output_dir: Path) -> None:
         log.warning("Static viewer emission failed: %s", exc)
 
 
+def publish_vercel_optional(args: argparse.Namespace, output_dir: Path) -> None:
+    """Optional Vercel/Astro publish step.
+
+    Only runs when ``--publish-vercel`` is set. Surfaces errors from the
+    publish module as fatal so the user sees a clear message (the static
+    filesystem output has already been written by this point and is
+    unaffected).
+    """
+    if not args.publish_vercel:
+        return
+    publisher = Path(__file__).parent / "publish_vercel.py"
+    if not publisher.exists():
+        raise RuntimeError(
+            f"--publish-vercel set but {publisher} is missing from the skill"
+        )
+    sys.path.insert(0, str(publisher.parent))
+    try:
+        import publish_vercel  # type: ignore[import-not-found]
+    finally:
+        sys.path.pop(0)
+    site_dir = (
+        Path(args.vercel_site_dir).expanduser().resolve()
+        if args.vercel_site_dir
+        else None
+    )
+    publish_vercel.publish(
+        output_dir=output_dir,
+        site_dir=site_dir,
+        slug=args.vercel_slug,
+        prod=args.vercel_prod,
+        yes=not args.vercel_no_yes,
+    )
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -613,6 +647,8 @@ def generate_wiki(args: argparse.Namespace) -> Path:
 
         if not args.no_static:
             build_static_optional(output_dir)
+
+        publish_vercel_optional(args, output_dir)
 
         elapsed = time.monotonic() - started
         log.info("✓ Wiki generated in %.1fs -> %s", elapsed, wiki_path)
@@ -700,6 +736,43 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "By default the generator bundles wiki.mdx into a static HTML file "
             "so the result can be opened directly via file:// without preview.py."
         ),
+    )
+    p.add_argument(
+        "--publish-vercel",
+        action="store_true",
+        help=(
+            "Optional: also publish the generated wiki to Vercel via Astro. "
+            "Requires the Vercel CLI to be installed and authenticated "
+            "(`npm i -g vercel && vercel login`). The default behaviour "
+            "(local filesystem output) is unchanged when this flag is omitted."
+        ),
+    )
+    p.add_argument(
+        "--vercel-site-dir",
+        default=os.environ.get("AUGGIE_DEEP_WIKI_SITE_DIR"),
+        help=(
+            "Path to a persistent Astro site directory used by --publish-vercel "
+            "(default: ~/.augment/deep-wiki-site). Reused across runs so "
+            "multiple wikis live under one Vercel project."
+        ),
+    )
+    p.add_argument(
+        "--vercel-slug",
+        default=None,
+        help=(
+            "Override the URL slug for this wiki (path /wikis/<slug>/). "
+            "Defaults to <owner>-<repo> derived from the cloned repo."
+        ),
+    )
+    p.add_argument(
+        "--vercel-prod",
+        action="store_true",
+        help="Deploy to production with `vercel deploy --prod` (default: preview)",
+    )
+    p.add_argument(
+        "--vercel-no-yes",
+        action="store_true",
+        help="Do not pass --yes to `vercel deploy` (force interactive prompts)",
     )
     p.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
     return p

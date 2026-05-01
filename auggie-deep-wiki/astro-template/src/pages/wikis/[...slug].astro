@@ -1,0 +1,27 @@
+---
+import { getCollection, render } from "astro:content";
+import WikiLayout from "../../layouts/WikiLayout.astro";
+
+export async function getStaticPaths() {
+  const wikis = await getCollection("wikis");
+  return wikis.map((entry) => ({
+    // Strip the trailing `/index` so each entry maps to /wikis/<slug>/.
+    params: { slug: entry.id.replace(/\/index$/, "") },
+    props: { entry },
+  }));
+}
+
+const { entry } = Astro.props;
+const { Content } = await render(entry);
+---
+
+<WikiLayout
+  title={entry.data.title}
+  description={entry.data.description}
+  repoUrl={entry.data.repo_url}
+  lastUpdated={entry.data.last_updated}
+  commitShort={entry.data.commit_hash_short}
+  commitFull={entry.data.commit_hash}
+>
+  <Content />
+</WikiLayout>
