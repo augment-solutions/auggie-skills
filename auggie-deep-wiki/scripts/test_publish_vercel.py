@@ -160,3 +160,84 @@ class TestEnsureSite:
         marker.write_text("// reused\n")
         assert pv.ensure_site(target) is False
         assert marker.read_text() == "// reused\n"
+
+
+# ---------------------------------------------------------------------------
+# _yaml_scalar — control-character escaping for frontmatter safety
+# ---------------------------------------------------------------------------
+class TestYamlScalar:
+    def test_string_quoted(self):
+        assert pv._yaml_scalar("hello") == '"hello"'
+
+    def test_quotes_escaped(self):
+        assert pv._yaml_scalar('say "hi"') == r'"say \"hi\""'
+
+    def test_backslash_escaped(self):
+        assert pv._yaml_scalar(r"path\to\file") == r'"path\\to\\file"'
+
+    def test_newline_escaped(self):
+        # Multi-line strings must escape \n / \r so the emitted YAML
+        # frontmatter remains a single quoted scalar (otherwise Astro's
+        # parser sees a partial document and errors).
+        assert pv._yaml_scalar("line1\nline2") == r'"line1\nline2"'
+
+    def test_carriage_return_escaped(self):
+        assert pv._yaml_scalar("a\r\nb") == r'"a\r\nb"'
+
+    def test_tab_escaped(self):
+        assert pv._yaml_scalar("a\tb") == r'"a\tb"'
+
+    def test_int_passthrough(self):
+        assert pv._yaml_scalar(42) == "42"
+
+    def test_bool_lowercased(self):
+        assert pv._yaml_scalar(True) == "true"
+        assert pv._yaml_scalar(False) == "false"
+
+    def test_list_of_strings(self):
+        assert pv._yaml_scalar(["a", "b"]) == '["a", "b"]'
+
+    def test_multiline_value_in_full_frontmatter(self):
+        # Regression: a multi-line description should not break the YAML
+        # bookends downstream of build_entry_mdx.
+        out = pv.build_entry_mdx(
+            wiki_mdx="# X",
+            metadata={"name": "thing", "github_description": "first\nsecond"},
+            structure=None,
+        )
+        assert r'description: "first\nsecond"' in out
+        assert out.count("---\n") == 2  # bookends only
+
+
+# ---------------------------------------------------------------------------
+# publish() — preflight checks gated by skip_deploy
+# ---------------------------------------------------------------------------
+class TestPublishSkipDeploy:
+    def test_skip_deploy_skips_cli_and_node_checks(self, tmp_path, monkeypatch):
+        # Sentinel: if these run with skip_deploy=True the test fails.
+        called: list[str] = []
+        monkeypatch.setattr(
+            pv, "check_vercel_cli", lambda: called.append("vercel") or "u"
+        )
+        monkeypatch.setattr(
+            pv, "check_node_npm", lambda: called.append("node")
+        )
+        monkeypatch.setattr(
+            pv, "npm_install_if_needed", lambda *a, **kw: called.append("npm")
+        )
+        monkeypatch.setattr(
+            pv, "vercel_deploy", lambda *a, **kw: called.append("deploy") or None
+        )
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "wiki.mdx").write_text("---\n# T\n\nbody\n---\n")
+
+        result = pv.publish(
+            output_dir=out_dir,
+            site_dir=tmp_path / "site",
+            skip_deploy=True,
+        )
+        assert called == []  # none of the gated steps ran
+        assert result.deployment_url is None
+        assert result.entry_path.exists()

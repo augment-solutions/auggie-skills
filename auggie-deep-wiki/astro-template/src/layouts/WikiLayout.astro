@@ -27,9 +27,14 @@ const {
 // Sidebar TOC shows h2/h3 only — matches preview/index.html behavior.
 const tocHeadings = headings.filter((h) => h.depth === 2 || h.depth === 3);
 
+// repo_url accepts non-http(s) values (SSH remote, local path) per the
+// content schema; only render it as a clickable link when it parses as
+// an http(s) URL so the browser doesn't treat `git@…` as a relative
+// path.
+const isWebUrl = !!repoUrl && /^https?:\/\//i.test(repoUrl);
 const commitLink =
-  repoUrl && commitFull && repoUrl.includes("github.com")
-    ? `${repoUrl.replace(/\.git$/, "").replace(/\/$/, "")}/commit/${commitFull}`
+  isWebUrl && commitFull && repoUrl!.includes("github.com")
+    ? `${repoUrl!.replace(/\.git$/, "").replace(/\/$/, "")}/commit/${commitFull}`
     : undefined;
 ---
 
@@ -87,9 +92,11 @@ const commitLink =
           <h1>{title}</h1>
           {description && <p class="lead">{description}</p>}
           <p class="meta">
-            {repoUrl && (
+            {repoUrl && (isWebUrl ? (
               <a href={repoUrl} target="_blank" rel="noopener">{repoUrl}</a>
-            )}
+            ) : (
+              <code>{repoUrl}</code>
+            ))}
             {lastUpdated && <span> · Last updated {lastUpdated}</span>}
             {commitShort && (
               <span>

@@ -105,6 +105,12 @@ def check_vercel_cli() -> str:
         proc = _run(["vercel", "whoami"], capture=True, check=False, timeout=30)
     except FileNotFoundError as exc:  # pragma: no cover - defensive
         raise PublishError(f"Failed to invoke vercel: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise PublishError(
+            "`vercel whoami` timed out after 30s. Check your network "
+            "connectivity and retry; if the issue persists, run "
+            "`vercel logout && vercel login` to refresh credentials."
+        ) from exc
     out = (proc.stdout or "") + (proc.stderr or "")
     if proc.returncode != 0 or not out.strip():
         raise PublishError(
@@ -160,7 +166,14 @@ def _yaml_scalar(value: Any) -> str:
     if isinstance(value, list):
         items = ", ".join(_yaml_scalar(v) for v in value)
         return f"[{items}]"
-    s = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    s = (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
     return f'"{s}"'
 
 
@@ -314,17 +327,32 @@ _URL_RE = re.compile(r"https?://[^\s]+")
 
 
 def vercel_deploy(site_dir: Path, *, prod: bool, yes: bool) -> str | None:
-    """Run ``vercel deploy`` and return the first URL printed by the CLI."""
+    """Run ``vercel deploy`` and return the first URL printed by the CLI.
+
+    When ``yes`` is True (typical scripted use), capture stdout/stderr so
+    the deployment URL can be extracted; the captured output is mirrored
+    to ``sys.stdout`` afterwards so the user still sees it. When ``yes``
+    is False the CLI may prompt for project linking, so we let stdout
+    and stderr inherit the parent TTY and skip URL extraction (callers
+    can fall back to ``vercel inspect``).
+    """
     cmd = ["vercel", "deploy"]
     if prod:
         cmd.append("--prod")
     if yes:
         cmd.append("--yes")
     log.info("Deploying to Vercel (%s)…", "prod" if prod else "preview")
+    if not yes:
+        # Interactive: don't capture so prompts/spinners are visible.
+        _run(cmd, cwd=site_dir, capture=False, timeout=1800)
+        return None
     proc = _run(cmd, cwd=site_dir, capture=True, timeout=1800)
     out = (proc.stdout or "") + "\n" + (proc.stderr or "")
     sys.stdout.write(out)
-    match = _URL_RE.search(proc.stdout or "")
+    # Vercel CLI emits the deployment URL on stdout in some versions and
+    # on stderr in others; search the combined stream so we don't log a
+    # spurious "Could not detect" warning on a successful deploy.
+    match = _URL_RE.search(out)
     if match:
         return match.group(0).rstrip(".,")
     return None
@@ -366,11 +394,16 @@ def publish(
 
     site_dir = Path(site_dir or DEFAULT_SITE_DIR).resolve()
 
-    check_vercel_cli()
-    check_node_npm()
+    # Preflight checks gate the deploy step. When the caller asks for a
+    # content-only write (``skip_deploy=True``) we skip them so the
+    # script remains usable without `vercel`/`node`/`npm` installed —
+    # e.g. for staging entries that will be deployed from CI later.
+    if not skip_deploy:
+        check_vercel_cli()
+        check_node_npm()
 
     fresh = ensure_site(site_dir)
-    if not skip_install:
+    if not skip_install and not skip_deploy:
         npm_install_if_needed(site_dir, force=fresh)
 
     metadata: dict[str, Any] = {}
