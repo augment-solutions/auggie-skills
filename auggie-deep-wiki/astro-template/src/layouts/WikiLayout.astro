@@ -1,0 +1,320 @@
+---
+// Layout for an individual wiki entry. Renders MDX content with a
+// sticky sidebar table of contents (mirroring the static viewer
+// preview/index.html), a theme toggle, and lazy Mermaid rendering.
+import type { MarkdownHeading } from "astro";
+
+interface Props {
+  title: string;
+  description?: string;
+  repoUrl?: string;
+  lastUpdated?: string;
+  commitShort?: string;
+  commitFull?: string;
+  headings?: MarkdownHeading[];
+}
+
+const {
+  title,
+  description,
+  repoUrl,
+  lastUpdated,
+  commitShort,
+  commitFull,
+  headings = [],
+} = Astro.props;
+
+// Sidebar TOC shows h2/h3 only — matches preview/index.html behavior.
+const tocHeadings = headings.filter((h) => h.depth === 2 || h.depth === 3);
+
+// repo_url accepts non-http(s) values (SSH remote, local path) per the
+// content schema; only render it as a clickable link when it parses as
+// an http(s) URL so the browser doesn't treat `git@…` as a relative
+// path.
+const isWebUrl = !!repoUrl && /^https?:\/\//i.test(repoUrl);
+const commitLink =
+  isWebUrl && commitFull && repoUrl!.includes("github.com")
+    ? `${repoUrl!.replace(/\.git$/, "").replace(/\/$/, "")}/commit/${commitFull}`
+    : undefined;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    {description && <meta name="description" content={description} />}
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <script is:inline>
+      // Apply saved or system-preferred theme before paint to avoid FOUC.
+      (function () {
+        try {
+          var saved = localStorage.getItem("deep-wiki-theme");
+          var systemDark = window.matchMedia(
+            "(prefers-color-scheme: dark)",
+          ).matches;
+          var theme = saved || (systemDark ? "dark" : "light");
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "light");
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="toc">
+        <div class="toc-header">
+          <h2>Contents</h2>
+          <button
+            id="theme-toggle"
+            type="button"
+            title="Toggle light/dark theme"
+            aria-label="Toggle theme"
+          >
+            <span class="icon-light">☀</span><span class="icon-dark">☾</span>
+          </button>
+        </div>
+        <a class="back" href="/">← All wikis</a>
+        <ol id="toc">
+          {tocHeadings.map((h) => (
+            <li>
+              <a href={`#${h.slug}`} class={h.depth === 3 ? "h3" : ""}>
+                {h.text}
+              </a>
+            </li>
+          ))}
+        </ol>
+      </aside>
+      <main>
+        <header class="page-header">
+          <h1>{title}</h1>
+          {description && <p class="lead">{description}</p>}
+          <p class="meta">
+            {repoUrl && (isWebUrl ? (
+              <a href={repoUrl} target="_blank" rel="noopener">{repoUrl}</a>
+            ) : (
+              <code>{repoUrl}</code>
+            ))}
+            {lastUpdated && <span> · Last updated {lastUpdated}</span>}
+            {commitShort && (
+              <span>
+                {" "}· Commit{" "}
+                {commitLink ? (
+                  <a href={commitLink} target="_blank" rel="noopener">
+                    {commitShort}
+                  </a>
+                ) : (
+                  <code>{commitShort}</code>
+                )}
+              </span>
+            )}
+          </p>
+        </header>
+        <article><slot /></article>
+      </main>
+    </div>
+
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+
+      const currentTheme = () =>
+        document.documentElement.getAttribute("data-theme") === "dark"
+          ? "dark"
+          : "default";
+      const initMermaid = () =>
+        mermaid.initialize({
+          startOnLoad: false,
+          theme: currentTheme(),
+          securityLevel: "loose",
+        });
+      initMermaid();
+
+      // Convert <pre><code class="language-mermaid"> blocks emitted by
+      // Astro/Shiki into <div class="mermaid"> nodes Mermaid can render.
+      const sources = [];
+      const blocks = document.querySelectorAll(
+        'pre > code.language-mermaid, pre[data-language="mermaid"] code',
+      );
+      blocks.forEach((code, i) => {
+        const pre = code.closest("pre");
+        if (!pre) return;
+        const div = document.createElement("div");
+        div.className = "mermaid";
+        div.id = `mermaid-${i}`;
+        const src = code.textContent || "";
+        sources.push({ id: div.id, code: src });
+        pre.replaceWith(div);
+      });
+
+      let renderToken = 0;
+      async function renderMermaid() {
+        const token = ++renderToken;
+        initMermaid();
+        for (const { id, code } of sources) {
+          if (token !== renderToken) return;
+          const el = document.getElementById(id);
+          if (!el) continue;
+          try {
+            const { svg } = await mermaid.render(id + "-svg-" + token, code);
+            el.innerHTML = svg;
+          } catch (e) {
+            el.textContent = code;
+          }
+        }
+      }
+      renderMermaid();
+
+      // Wire up the theme toggle button. Persists explicit user choice.
+      const toggleBtn = document.getElementById("theme-toggle");
+      if (toggleBtn) {
+        toggleBtn.addEventListener("click", () => {
+          const next =
+            document.documentElement.getAttribute("data-theme") === "dark"
+              ? "light"
+              : "dark";
+          document.documentElement.setAttribute("data-theme", next);
+          try {
+            localStorage.setItem("deep-wiki-theme", next);
+          } catch (_) {}
+          renderMermaid();
+        });
+      }
+
+      // Follow system theme changes only when no explicit choice is saved.
+      window
+        .matchMedia("(prefers-color-scheme: dark)")
+        .addEventListener("change", (e) => {
+          let saved = null;
+          try {
+            saved = localStorage.getItem("deep-wiki-theme");
+          } catch (_) {}
+          if (saved) return;
+          document.documentElement.setAttribute(
+            "data-theme",
+            e.matches ? "dark" : "light",
+          );
+          renderMermaid();
+        });
+    </script>
+
+    <style is:global>
+      :root {
+        --bg: #ffffff; --fg: #1f2328; --muted: #57606a;
+        --border: #d1d9e0; --code-bg: #f6f8fa; --link: #0969da;
+        --sidebar-bg: #f6f8fa; --error-bg: #ffebe9;
+      }
+      [data-theme="dark"] {
+        --bg: #0d1117; --fg: #e6edf3; --muted: #8b949e;
+        --border: #30363d; --code-bg: #161b22; --link: #58a6ff;
+        --sidebar-bg: #010409; --error-bg: #2d1418;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+          system-ui, sans-serif;
+        line-height: 1.55;
+      }
+      a { color: var(--link); }
+      .layout {
+        display: grid; grid-template-columns: 280px 1fr; min-height: 100vh;
+      }
+      aside.toc {
+        position: sticky; top: 0; align-self: start; height: 100vh;
+        overflow: auto; padding: 24px 16px;
+        background: var(--sidebar-bg); border-right: 1px solid var(--border);
+        font-size: 13px;
+      }
+      aside.toc .toc-header {
+        display: flex; align-items: center; justify-content: space-between;
+        margin: 0 0 12px;
+      }
+      aside.toc h2 {
+        font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+        color: var(--muted); margin: 0;
+      }
+      aside.toc .back {
+        display: inline-block; margin: 0 0 12px; padding: 4px 8px;
+        font-size: 12px; color: var(--muted); text-decoration: none;
+        border-radius: 4px;
+      }
+      aside.toc .back:hover { background: var(--code-bg); }
+      button#theme-toggle {
+        background: transparent; border: 1px solid var(--border);
+        color: var(--fg); border-radius: 4px; padding: 4px 8px;
+        font-size: 14px; cursor: pointer; line-height: 1;
+      }
+      button#theme-toggle:hover { background: var(--code-bg); }
+      button#theme-toggle .icon-dark { display: none; }
+      [data-theme="dark"] button#theme-toggle .icon-light { display: none; }
+      [data-theme="dark"] button#theme-toggle .icon-dark { display: inline; }
+      aside.toc ol { list-style: none; padding: 0; margin: 0; }
+      aside.toc a {
+        display: block; padding: 4px 8px; color: var(--fg);
+        text-decoration: none; border-radius: 4px;
+      }
+      aside.toc a:hover { background: var(--code-bg); }
+      aside.toc a.h3 {
+        padding-left: 24px; color: var(--muted); font-size: 12px;
+      }
+      main { padding: 32px 48px; max-width: 920px; }
+      .page-header { margin-bottom: 1rem; padding-bottom: 1rem;
+        border-bottom: 1px solid var(--border); }
+      .page-header h1 { margin: 0 0 0.5rem; font-size: 2em;
+        font-weight: 600; line-height: 1.25; }
+      .lead { color: var(--muted); margin: 0.25rem 0; }
+      .meta { color: var(--muted); font-size: 0.9rem; }
+      article h1, article h2, article h3 {
+        font-weight: 600; line-height: 1.25;
+      }
+      article h2 {
+        font-size: 1.5em; margin-top: 1.6em;
+        border-bottom: 1px solid var(--border); padding-bottom: 0.3em;
+      }
+      article h3 { font-size: 1.2em; margin-top: 1.4em; }
+      article code:not(pre code) {
+        background: var(--code-bg); padding: 0.2em 0.4em; border-radius: 4px;
+        font-size: 85%;
+        font-family: ui-monospace, SFMono-Regular, monospace;
+      }
+      article pre {
+        background: var(--code-bg); padding: 16px; border-radius: 6px;
+        overflow: auto;
+        font-family: ui-monospace, SFMono-Regular, monospace; font-size: 85%;
+      }
+      article pre code { background: transparent; padding: 0; }
+      .mermaid {
+        background: var(--code-bg); padding: 16px; border-radius: 6px;
+        text-align: center; overflow: auto;
+      }
+      article hr {
+        border: none; border-top: 1px solid var(--border); margin: 2em 0;
+      }
+      article details {
+        border: 1px solid var(--border); border-radius: 6px;
+        padding: 8px 12px; margin: 8px 0;
+      }
+      article summary { cursor: pointer; font-weight: 500; }
+      article blockquote {
+        border-left: 4px solid var(--border); margin: 0; padding: 0 1em;
+        color: var(--muted);
+      }
+      article table {
+        border-collapse: collapse; width: 100%; margin: 1em 0;
+      }
+      article th, article td {
+        border: 1px solid var(--border); padding: 6px 12px; text-align: left;
+      }
+      article th { background: var(--code-bg); }
+      @media (max-width: 768px) {
+        .layout { grid-template-columns: 1fr; }
+        aside.toc {
+          position: static; height: auto; max-height: 280px;
+        }
+        main { padding: 16px 20px; }
+      }
+    </style>
+  </body>
+</html>

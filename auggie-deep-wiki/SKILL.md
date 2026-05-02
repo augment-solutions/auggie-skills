@@ -1,6 +1,6 @@
 ---
 name: auggie-deep-wiki
-description: Generate a DeepWiki-style MDX repository guide (with Mermaid diagrams) by orchestrating the headless `auggie` CLI through three sequential steps — repo metadata, wiki structure, and per-section MDX. Use when the user asks to "generate a deep wiki", "create repository documentation", "write a DeepWiki-style guide", "scan a repo and produce an MDX wiki", "auto-document this codebase as MDX", or any equivalent ask that wants a multi-section MDX deliverable describing a repository's architecture and key modules. Triggers on phrases like "deep wiki", "auto-generate wiki", "MDX repo guide", "repository walkthrough as MDX", "DeepWiki for &lt;repo&gt;".
+description: Generate a DeepWiki-style MDX repository guide (with Mermaid diagrams) by orchestrating the headless `auggie` CLI through three sequential steps — repo metadata, wiki structure, and per-section MDX. Use when the user asks to "generate a deep wiki", "create repository documentation", "write a DeepWiki-style guide", "scan a repo and produce an MDX wiki", "auto-document this codebase as MDX", or any equivalent ask that wants a multi-section MDX deliverable describing a repository's architecture and key modules. Triggers on phrases like "deep wiki", "auto-generate wiki", "MDX repo guide", "repository walkthrough as MDX", "DeepWiki for &lt;repo&gt;". The skill can also publish the resulting wiki to Vercel via Astro when the user includes phrases like "publish to Vercel", "deploy to Vercel", "host on Vercel", or "ship the wiki to Vercel" — in that case pass `--publish-vercel` to the orchestrator. The default behaviour (local filesystem output only) is unchanged when no Vercel phrase is present.
 ---
 
 # auggie-deep-wiki
@@ -32,6 +32,11 @@ Before invoking the skill, make sure the user has:
 - Optional, for MDX validation: Node.js + `@mdx-js/mdx`
   (`npm install -g @mdx-js/mdx`). Without it, validation is skipped with a
   warning rather than failing the run.
+- Optional, for `--publish-vercel`: Node.js 20+, `npm`, and the Vercel CLI
+  authenticated as the user (`npm i -g vercel && vercel login`). When the
+  CLI is missing or `vercel whoami` fails, the publish step aborts with
+  an actionable error before touching anything; the local filesystem
+  output is unaffected.
 
 If any prerequisite is missing, tell the user and stop — do not attempt to
 install software on their behalf without permission.
@@ -46,13 +51,22 @@ Typical asks:
 - "Auto-document the architecture of `<repo>` as MDX with Mermaid diagrams."
 - "Run the deep-wiki generator on `<url>` and put it in `./out/`."
 
+Use it **with `--publish-vercel`** when the user explicitly asks to
+"publish to Vercel", "deploy the wiki to Vercel", "host the wiki on
+Vercel", or similar. This is opt-in — never publish without an explicit
+ask. The publish step reuses a single Astro site under
+`~/.augment/deep-wiki-site` (overridable via `--vercel-site-dir`) so
+multiple deep-wiki outputs share one Vercel project, each at
+`/wikis/<slug>/`.
+
 Do **not** use this skill for:
 
 - Single-file READMEs (overkill — write the file directly).
 - API docs / docstrings (different shape; use language-specific tooling).
-- Anything that needs to push results to Sanity, GitHub Pages, or a CMS — the
-  skill only writes local files; deployment is a separate step the user
-  must approve.
+- Pushing to Sanity, GitHub Pages, or other CMS targets — the only
+  deployment target this skill supports is `--publish-vercel`. For
+  anything else the skill writes local files only and the user picks the
+  next step.
 
 ## How to invoke
 
@@ -77,9 +91,48 @@ Common flags:
 - `--skip-validate`: skip the optional Node MDX validation pass.
 - `--no-static`: skip auto-emitting `<output-dir>/index.html` (the
   self-contained browser viewer; emitted by default).
+- `--publish-vercel`: also publish the wiki to Vercel via Astro
+  (opt-in; see below).
+- `--vercel-site-dir <path>`: persistent Astro site directory (default:
+  `~/.augment/deep-wiki-site`). Reused across runs.
+- `--vercel-slug <slug>`: override the URL slug; default is
+  `<owner>-<repo>` derived from the cloned repo.
+- `--vercel-prod`: deploy to production (default: preview deployment).
 - `--verbose` (`-v`): debug logs.
 
 `--help` lists all flags.
+
+## Publishing to Vercel (optional)
+
+Triggered only when the user mentions "publish to Vercel" (or an
+equivalent phrase) **and** the orchestrator is run with
+`--publish-vercel`. The static filesystem output is still produced first;
+publishing is an additive step on top.
+
+What happens, in order:
+
+1. `vercel whoami` is invoked. If the CLI is missing or unauthenticated,
+   the publish step aborts with the exact remediation command (`npm i -g
+   vercel` and/or `vercel login`). No files in the user's Vercel account
+   are touched in this case.
+2. The Astro site at `--vercel-site-dir` (default
+   `~/.augment/deep-wiki-site`) is created from the bundled
+   `astro-template/` on first run, and `npm install` runs once.
+3. The generated `wiki.mdx` is rewrapped with valid Astro frontmatter
+   (title, description, repo URL, last-updated/commit, stars, language,
+   topics) and copied to
+   `<site-dir>/src/content/wikis/<slug>/index.mdx`. Existing entries for
+   other repos are left in place.
+4. `vercel deploy` runs from `<site-dir>` (preview by default;
+   `--vercel-prod` for production). The first deployment links the
+   directory to a Vercel project — let it prompt the user once, or
+   pre-link with `vercel link` before running the skill.
+5. The deployment URL plus the wiki's path (`/wikis/<slug>/`) are logged.
+
+Multi-wiki layout: every wiki is one entry in the `wikis` content
+collection, so a single Astro project on a single Vercel project hosts
+all of them. The landing page (`/`) lists everything; each wiki lives at
+`/wikis/<slug>/`.
 
 ## Output layout
 
