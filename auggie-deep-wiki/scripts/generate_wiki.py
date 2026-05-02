@@ -554,37 +554,47 @@ def build_static_optional(output_dir: Path) -> None:
         log.warning("Static viewer emission failed: %s", exc)
 
 
-def publish_vercel_optional(args: argparse.Namespace, output_dir: Path) -> None:
-    """Optional Vercel/Astro publish step.
+def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> None:
+    """Optional Git-backed Astro publish step.
 
-    Only runs when ``--publish-vercel`` is set. Surfaces errors from the
-    publish module as fatal so the user sees a clear message (the static
-    filesystem output has already been written by this point and is
-    unaffected).
+    Only runs when ``--publish-git`` is set. Clones a host Astro
+    repository, writes the new wiki entry, and pushes. The default
+    behaviour (local filesystem output) is unchanged when this flag is
+    omitted, so this step is purely additive and any failure here
+    leaves the local ``wiki.mdx``/``index.html`` deliverables intact.
     """
-    if not args.publish_vercel:
+    if not args.publish_git:
         return
-    publisher = Path(__file__).parent / "publish_vercel.py"
+    publisher = Path(__file__).parent / "publish_git.py"
     if not publisher.exists():
         raise RuntimeError(
-            f"--publish-vercel set but {publisher} is missing from the skill"
+            f"--publish-git set but {publisher} is missing from the skill"
         )
     sys.path.insert(0, str(publisher.parent))
     try:
-        import publish_vercel  # type: ignore[import-not-found]
+        import publish_git  # type: ignore[import-not-found]
     finally:
         sys.path.pop(0)
-    site_dir = (
-        Path(args.vercel_site_dir).expanduser().resolve()
-        if args.vercel_site_dir
+    work_dir = (
+        Path(args.wiki_work_dir).expanduser().resolve()
+        if args.wiki_work_dir
         else None
     )
-    publish_vercel.publish(
+    result = publish_git.publish(
         output_dir=output_dir,
-        site_dir=site_dir,
-        slug=args.vercel_slug,
-        prod=args.vercel_prod,
-        yes=not args.vercel_no_yes,
+        wiki_repo=args.wiki_repo,
+        branch=args.wiki_branch,
+        slug=args.wiki_slug,
+        push=not args.no_push,
+        work_dir=work_dir,
+        keep_work_dir=args.keep_wiki_work_dir,
+    )
+    log.info(
+        "Published %s -> %s (commit=%s pushed=%s)",
+        result.slug,
+        result.entry_path,
+        result.commit_sha or "<no-change>",
+        result.pushed,
     )
 
 
@@ -648,7 +658,7 @@ def generate_wiki(args: argparse.Namespace) -> Path:
         if not args.no_static:
             build_static_optional(output_dir)
 
-        publish_vercel_optional(args, output_dir)
+        publish_git_optional(args, output_dir)
 
         elapsed = time.monotonic() - started
         log.info("✓ Wiki generated in %.1fs -> %s", elapsed, wiki_path)
@@ -738,41 +748,57 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--publish-vercel",
+        "--publish-git",
         action="store_true",
         help=(
-            "Optional: also publish the generated wiki to Vercel via Astro. "
-            "Requires the Vercel CLI to be installed and authenticated "
-            "(`npm i -g vercel && vercel login`). The default behaviour "
-            "(local filesystem output) is unchanged when this flag is omitted."
+            "Optional: clone a Git-backed Astro site repo and append "
+            "this wiki to it (then push). The local filesystem output "
+            "is unchanged when this flag is omitted. Requires --wiki-repo "
+            "or $DEEP_WIKIS_GIT_REPO; uses $GITHUB_TOKEN for HTTPS auth "
+            "when present, otherwise falls back to git's default "
+            "credentials (SSH key, credential helper)."
         ),
     )
     p.add_argument(
-        "--vercel-site-dir",
-        default=os.environ.get("AUGGIE_DEEP_WIKI_SITE_DIR"),
+        "--wiki-repo",
+        default=os.environ.get("DEEP_WIKIS_GIT_REPO"),
         help=(
-            "Path to a persistent Astro site directory used by --publish-vercel "
-            "(default: ~/.augment/deep-wiki-site). Reused across runs so "
-            "multiple wikis live under one Vercel project."
+            "URL of the host Astro repo to publish into (e.g. "
+            "https://github.com/<org>/deep-wikis.git). Required when "
+            "--publish-git is set; can also be set via "
+            "$DEEP_WIKIS_GIT_REPO."
         ),
     )
     p.add_argument(
-        "--vercel-slug",
+        "--wiki-branch",
+        default="main",
+        help="Branch on the host repo to push to (default: main)",
+    )
+    p.add_argument(
+        "--wiki-slug",
         default=None,
         help=(
-            "Override the URL slug for this wiki (path /wikis/<slug>/). "
-            "Defaults to <owner>-<repo> derived from the cloned repo."
+            "Override the URL slug for this wiki "
+            "(path /wikis/<slug>/). Defaults to <owner>-<repo>."
         ),
     )
     p.add_argument(
-        "--vercel-prod",
-        action="store_true",
-        help="Deploy to production with `vercel deploy --prod` (default: preview)",
+        "--wiki-work-dir",
+        default=None,
+        help=(
+            "Persistent clone directory for the host repo (default: "
+            "ephemeral temp dir, removed on success)."
+        ),
     )
     p.add_argument(
-        "--vercel-no-yes",
+        "--keep-wiki-work-dir",
         action="store_true",
-        help="Do not pass --yes to `vercel deploy` (force interactive prompts)",
+        help="Keep the host-repo clone after a successful run (debugging)",
+    )
+    p.add_argument(
+        "--no-push",
+        action="store_true",
+        help="Commit locally only; do not push the host repo (dry-run)",
     )
     p.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
     return p
