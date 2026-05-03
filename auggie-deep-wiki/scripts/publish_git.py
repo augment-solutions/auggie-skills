@@ -70,6 +70,24 @@ class PublishResult:
 # ---------------------------------------------------------------------------
 # subprocess helper
 # ---------------------------------------------------------------------------
+_AUTH_HEADER_RE = re.compile(
+    r"(http\.extraHeader=Authorization:\s*Bearer\s+)\S+", re.IGNORECASE
+)
+_URL_USERINFO_RE = re.compile(r"(https?://)[^/@\s]+@")
+
+
+def _redact(text: str) -> str:
+    """Strip credentials from a string before it lands in logs or errors."""
+    text = _AUTH_HEADER_RE.sub(r"\1***", text)
+    text = _URL_USERINFO_RE.sub(r"\1***@", text)
+    return text
+
+
+def _redact_cmd(cmd: list[str]) -> str:
+    """Render ``cmd`` as a shell-ish string with auth tokens masked."""
+    return _redact(" ".join(cmd))
+
+
 def _run(
     cmd: list[str],
     *,
@@ -79,20 +97,28 @@ def _run(
     capture: bool = False,
     timeout: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    log.debug("$ %s (cwd=%s)", " ".join(cmd), cwd)
-    proc = subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.PIPE if capture else None,
-        timeout=timeout,
-    )
-    if check and proc.returncode != 0:
-        out = (proc.stdout or "") + (proc.stderr or "")
+    safe_cmd = _redact_cmd(cmd)
+    log.debug("$ %s (cwd=%s)", safe_cmd, cwd)
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
         raise PublishError(
-            f"Command failed (exit {proc.returncode}): {' '.join(cmd)}\n{out}"
+            f"Command timed out after {exc.timeout}s: {safe_cmd}"
+        ) from exc
+    except OSError as exc:
+        raise PublishError(f"Command not runnable ({exc}): {safe_cmd}") from exc
+    if check and proc.returncode != 0:
+        out = _redact((proc.stdout or "") + (proc.stderr or ""))
+        raise PublishError(
+            f"Command failed (exit {proc.returncode}): {safe_cmd}\n{out}"
         )
     return proc
 
@@ -101,6 +127,27 @@ def _run(
 # slug + frontmatter helpers (unchanged behaviour from publish_vercel.py)
 # ---------------------------------------------------------------------------
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+# Slugs become directory names under ``src/content/wikis/``; the regex below
+# is the *only* shape we accept after sanitization.  It deliberately disallows
+# path separators, ``..``, leading dots, and any non-ASCII character so a
+# malicious or malformed value cannot escape ``CONTENT_SUBPATH``.
+_SAFE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,99}$")
+
+
+def _sanitize_slug(slug: str) -> str:
+    """Return ``slug`` if it matches ``_SAFE_SLUG_RE``, else raise.
+
+    Used at both the CLI boundary (user-supplied ``--slug``) and the
+    filesystem boundary in :func:`write_entry` so any future caller
+    inherits the same guard.
+    """
+    candidate = (slug or "").strip()
+    if not _SAFE_SLUG_RE.match(candidate):
+        raise PublishError(
+            "Invalid slug: must match [a-z0-9][a-z0-9_-]{0,99} "
+            f"(got {slug!r})"
+        )
+    return candidate
 
 
 def derive_slug(repo_url: str | None, metadata: dict[str, Any] | None) -> str:
@@ -235,6 +282,47 @@ def _resolve_token() -> str | None:
     return None
 
 
+def _refresh_existing_clone(
+    repo_url: str,
+    branch: str,
+    work_dir: Path,
+    *,
+    token: str | None,
+) -> None:
+    """Bring a reusable persistent clone up to date with ``origin/<branch>``.
+
+    Resets the local branch to the remote tip so a stale checkout from
+    a previous run cannot leak old state into the new commit.
+    """
+    git_dir = work_dir / ".git"
+    if not git_dir.is_dir():
+        raise PublishError(
+            f"Clone target exists but is not a git repository: {work_dir}"
+        )
+    log.info("Reusing existing clone at %s; refreshing %s", work_dir, branch)
+    base = _git_base(token)
+    _run(
+        base + ["remote", "set-url", "origin", repo_url],
+        cwd=work_dir, capture=True, timeout=CLONE_TIMEOUT,
+    )
+    _run(
+        base + ["fetch", "--depth=1", "origin", branch],
+        cwd=work_dir, capture=True, timeout=CLONE_TIMEOUT,
+    )
+    _run(
+        base + ["checkout", "-B", branch, f"origin/{branch}"],
+        cwd=work_dir, capture=True, timeout=CLONE_TIMEOUT,
+    )
+    _run(
+        base + ["reset", "--hard", f"origin/{branch}"],
+        cwd=work_dir, capture=True, timeout=CLONE_TIMEOUT,
+    )
+    _run(
+        base + ["clean", "-fdx"],
+        cwd=work_dir, capture=True, timeout=CLONE_TIMEOUT,
+    )
+
+
 def clone_host_repo(
     repo_url: str,
     branch: str,
@@ -242,9 +330,25 @@ def clone_host_repo(
     *,
     token: str | None,
 ) -> None:
-    """Shallow-clone the host repo into ``work_dir`` (must not exist)."""
+    """Provision ``work_dir`` to point at ``origin/<branch>``.
+
+    If ``work_dir`` is missing, do a shallow clone.  If it already
+    contains a git checkout, refresh it in place so ``--work-dir`` and
+    ``--keep-work-dir`` can be reused across runs without manual cleanup.
+    A non-empty, non-git directory is rejected to avoid clobbering
+    unrelated content.
+    """
     if work_dir.exists():
-        raise PublishError(f"Clone target already exists: {work_dir}")
+        if (work_dir / ".git").is_dir():
+            _refresh_existing_clone(repo_url, branch, work_dir, token=token)
+            return
+        if any(work_dir.iterdir()):
+            raise PublishError(
+                "Clone target exists and is not a git repository "
+                f"(refusing to overwrite): {work_dir}"
+            )
+        # Empty directory — git clone refuses to clone into it, so remove first.
+        work_dir.rmdir()
     cmd = _git_base(token) + [
         "clone",
         "--depth=1",
@@ -265,10 +369,25 @@ def write_entry(
     metadata: dict[str, Any],
     structure: dict[str, Any] | None,
 ) -> Path:
-    """Replace ``src/content/wikis/<slug>/`` with a fresh ``index.mdx``."""
-    target_dir = work_dir / CONTENT_SUBPATH / slug
+    """Replace ``src/content/wikis/<slug>/`` with a fresh ``index.mdx``.
+
+    The ``slug`` is sanitized once more here (defense in depth) so the
+    resulting ``target_dir`` cannot escape ``CONTENT_SUBPATH``.
+    """
+    safe_slug = _sanitize_slug(slug)
+    base_dir = (work_dir / CONTENT_SUBPATH).resolve()
+    target_dir = (base_dir / safe_slug).resolve()
+    # Ensure ``target_dir`` stays under ``base_dir`` even if a future
+    # ``CONTENT_SUBPATH`` change introduces symlinks or path normalization
+    # surprises.
+    try:
+        target_dir.relative_to(base_dir)
+    except ValueError as exc:
+        raise PublishError(
+            f"Refusing to write outside content collection: {target_dir}"
+        ) from exc
     if target_dir.exists():
-        log.info("Replacing existing entry %s", target_dir.relative_to(work_dir))
+        log.info("Replacing existing entry %s", target_dir.relative_to(work_dir.resolve()))
         shutil.rmtree(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     entry = target_dir / "index.mdx"
@@ -321,10 +440,12 @@ def commit_and_push(
         return None, False
     msg = f"deep-wiki: update {slug}"
     _run(["git", "commit", "-m", msg], cwd=work_dir, env=env, capture=True)
-    sha_proc = _run(
-        ["git", "rev-parse", "HEAD"], cwd=work_dir, capture=True
-    )
-    sha = (sha_proc.stdout or "").strip() or None
+
+    def _head_sha() -> str | None:
+        proc = _run(["git", "rev-parse", "HEAD"], cwd=work_dir, capture=True)
+        return (proc.stdout or "").strip() or None
+
+    sha = _head_sha()
 
     if not push:
         log.info("Skipping push (--no-push); commit %s left in %s", sha, work_dir)
@@ -337,7 +458,7 @@ def commit_and_push(
         if proc.returncode == 0:
             log.info("Pushed %s to origin/%s", sha[:8] if sha else "?", branch)
             return sha, True
-        err = (proc.stderr or "") + (proc.stdout or "")
+        err = _redact((proc.stderr or "") + (proc.stdout or ""))
         if "non-fast-forward" in err or "fetch first" in err or "rejected" in err:
             log.warning(
                 "Push rejected (concurrent update?); rebasing and retrying [%d/%d]",
@@ -346,6 +467,10 @@ def commit_and_push(
             )
             pull_cmd = _git_base(token) + ["pull", "--rebase", "origin", branch]
             _run(pull_cmd, cwd=work_dir, env=env, capture=True, timeout=PUSH_TIMEOUT)
+            # Rebase rewrites the local commit, so refresh ``sha`` before
+            # retrying so the success-path log and the returned value
+            # reflect the actual commit being pushed.
+            sha = _head_sha()
             last_err = PublishError(err.strip())
             continue
         raise PublishError(f"git push failed: {err.strip()}")
@@ -398,7 +523,9 @@ def publish(
     metadata = _load_optional_json(output_dir / "repo_metadata.json")
     structure = _load_optional_json(output_dir / "wiki_structure.json")
 
-    final_slug = slug or derive_slug(metadata.get("repo_url"), metadata)
+    final_slug = _sanitize_slug(
+        slug or derive_slug(metadata.get("repo_url"), metadata)
+    )
     log.info("Slug: %s", final_slug)
 
     token = _resolve_token()
@@ -411,7 +538,12 @@ def publish(
     try:
         if work_dir is None:
             tmp = Path(tempfile.mkdtemp(prefix="deep-wikis-clone-"))
-            cleanup_dir = tmp if not keep_work_dir else None
+            # When --no-push is used we deliberately keep the temp dir so the
+            # operator can inspect the dry-run commit; otherwise honour
+            # ``keep_work_dir``.  An explicit ``--work-dir`` is never owned
+            # by us and is left alone.
+            if push and not keep_work_dir:
+                cleanup_dir = tmp
             target = tmp / "deep-wikis"
         else:
             target = Path(work_dir).resolve()
@@ -434,11 +566,16 @@ def publish(
             author_name=author_name,
             author_email=author_email,
         )
+        if not push:
+            log.info("Work dir preserved at %s (use --no-push only for dry runs)", target)
         return PublishResult(
             repo_url=repo_url,
             branch=branch,
             slug=final_slug,
-            entry_path=entry.relative_to(target),
+            # Both sides resolved so the relative_to works regardless of
+            # symlinks introduced by ``tempfile.mkdtemp`` on macOS
+            # (``/var/folders`` -> ``/private/var/folders``).
+            entry_path=entry.resolve().relative_to(target.resolve()),
             commit_sha=sha,
             pushed=pushed,
         )

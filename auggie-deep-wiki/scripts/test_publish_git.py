@@ -6,19 +6,23 @@ Run with::
 
 Covers:
 - ``derive_slug``           — metadata-first, URL fallback, default.
+- ``_sanitize_slug``        — directory-traversal guard.
 - ``_strip_existing_frontmatter`` — assembler bookend handling.
 - ``build_entry_mdx``       — Astro frontmatter assembly with control-char escaping.
 - ``_yaml_scalar``          — quoting, control chars, lists, bools.
 - ``_git_base`` / ``_resolve_token`` — auth-header injection.
+- ``_run`` / ``_redact``    — token masking + timeout translation.
 - ``write_entry``           — atomic content-collection entry replacement.
 - ``publish``               — end-to-end with mocked git/clone (no network).
 """
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
 
@@ -291,3 +295,158 @@ class TestPublish:
                 wiki_repo="https://github.com/x/y.git",
                 push=False,
             )
+
+
+
+# ---------------------------------------------------------------------------
+# slug sanitization (directory-traversal guard)
+# ---------------------------------------------------------------------------
+class TestSanitizeSlug:
+    @pytest.mark.parametrize("slug", ["pallets-click", "abc", "a", "x_y-z", "repo123"])
+    def test_accepts_valid(self, slug):
+        assert pg._sanitize_slug(slug) == slug
+
+    @pytest.mark.parametrize(
+        "slug",
+        [
+            "",
+            " ",
+            "..",
+            "../escape",
+            "../../etc/passwd",
+            "/abs/path",
+            "with/slash",
+            "back\\slash",
+            "-leading-dash",
+            "_leading-underscore",
+            "UPPER",
+            "café",
+            "name with space",
+            "x" * 101,
+        ],
+    )
+    def test_rejects_invalid(self, slug):
+        with pytest.raises(pg.PublishError, match="Invalid slug"):
+            pg._sanitize_slug(slug)
+
+    def test_write_entry_rejects_traversal(self, tmp_path):
+        with pytest.raises(pg.PublishError, match="Invalid slug"):
+            pg.write_entry(
+                tmp_path,
+                "../escape",
+                wiki_mdx="# x",
+                metadata={"name": "x"},
+                structure=None,
+            )
+        # Nothing written above the content collection root.
+        assert not (tmp_path.parent / "escape").exists()
+
+
+# ---------------------------------------------------------------------------
+# _redact + _run token masking and timeout translation
+# ---------------------------------------------------------------------------
+class TestRedact:
+    def test_masks_authorization_header_in_string(self):
+        out = pg._redact(
+            "git -c http.extraHeader=Authorization: Bearer ghp_secret123 clone url"
+        )
+        assert "ghp_secret123" not in out
+        assert "Bearer ***" in out
+
+    def test_masks_userinfo_in_url(self):
+        assert pg._redact("https://user:pass@github.com/x") == "https://***@github.com/x"
+
+    def test_redact_cmd_handles_token_token(self):
+        cmd = pg._git_base("ghp_topsecret") + ["clone", "https://github.com/x.git"]
+        rendered = pg._redact_cmd(cmd)
+        assert "ghp_topsecret" not in rendered
+        assert "Bearer ***" in rendered
+
+
+class TestRunHelper:
+    def test_timeout_becomes_publish_error(self):
+        def fake_run(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=args[0], timeout=5)
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            with pytest.raises(pg.PublishError, match="timed out after 5s"):
+                pg._run(["git", "clone", "url"], timeout=5)
+
+    def test_publish_error_redacts_command_token(self):
+        # Stderr that mimics a real git failure (no raw token) — the review
+        # flagged the *command* being embedded verbatim, which is what we
+        # need to verify here.
+        completed = subprocess.CompletedProcess(
+            args=["git"], returncode=1, stdout="", stderr="fatal: not allowed"
+        )
+        with mock.patch("subprocess.run", return_value=completed):
+            cmd = pg._git_base("ghp_secret123") + ["push"]
+            with pytest.raises(pg.PublishError) as excinfo:
+                pg._run(cmd, capture=True)
+        msg = str(excinfo.value)
+        assert "ghp_secret123" not in msg
+        assert "Bearer ***" in msg
+
+    def test_oserror_becomes_publish_error(self):
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError("no git")):
+            with pytest.raises(pg.PublishError, match="not runnable"):
+                pg._run(["git", "version"])
+
+
+# ---------------------------------------------------------------------------
+# clone_host_repo — reusable existing work_dir
+# ---------------------------------------------------------------------------
+class TestCloneHostRepo:
+    def test_existing_clone_is_refreshed(self, tmp_path, monkeypatch):
+        work_dir = tmp_path / "deep-wikis"
+        (work_dir / ".git").mkdir(parents=True)
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(pg, "_run", fake_run)
+        pg.clone_host_repo("https://x/y.git", "main", work_dir, token=None)
+
+        verbs = [c[1] for c in calls]
+        assert "clone" not in verbs
+        assert "fetch" in verbs
+        assert "reset" in verbs
+        assert "clean" in verbs
+
+    def test_non_git_dir_rejected(self, tmp_path):
+        work_dir = tmp_path / "stuff"
+        work_dir.mkdir()
+        (work_dir / "unrelated.txt").write_text("hi")
+        with pytest.raises(pg.PublishError, match="not a git repository"):
+            pg.clone_host_repo("https://x/y.git", "main", work_dir, token=None)
+
+
+# ---------------------------------------------------------------------------
+# publish() — --no-push preserves the temp work dir
+# ---------------------------------------------------------------------------
+class TestPublishNoPushPreservesWorkDir:
+    def test_temp_dir_kept_when_push_disabled(self, tmp_path, monkeypatch):
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "wiki.mdx").write_text("---\n# T\n---\n")
+        (out / "repo_metadata.json").write_text(
+            '{"owner": "pallets", "name": "click"}'
+        )
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+
+        seen: dict[str, Path] = {}
+
+        def fake_clone(repo_url, branch, work_dir, *, token):
+            (work_dir / "src" / "content" / "wikis").mkdir(parents=True)
+            seen["work_dir"] = work_dir
+
+        monkeypatch.setattr(pg, "clone_host_repo", fake_clone)
+        monkeypatch.setattr(pg, "commit_and_push", lambda *a, **kw: ("abc", False))
+
+        result = pg.publish(output_dir=out, push=False)
+        assert result.pushed is False
+        # The clone target lives under a temp dir that publish() must not
+        # delete when push is disabled — operators rely on it for inspection.
+        assert seen["work_dir"].exists()
