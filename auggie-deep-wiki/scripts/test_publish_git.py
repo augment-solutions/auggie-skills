@@ -258,7 +258,12 @@ class TestPublish:
             pg, "commit_and_push", lambda *a, **kw: ("abc1234", False)
         )
 
-        result = pg.publish(output_dir=out, push=False)
+        # Use an explicit work_dir under tmp_path so pytest cleans up after
+        # the test; otherwise publish() with ``push=False`` would leave a
+        # ``deep-wikis-clone-*`` dir in the system temp directory.
+        result = pg.publish(
+            output_dir=out, work_dir=tmp_path / "clone-env", push=False
+        )
         assert captured["repo_url"] == "https://github.com/x/y.git"
         assert captured["branch"] == "main"
         assert result.slug == "pallets-click"
@@ -282,6 +287,7 @@ class TestPublish:
         pg.publish(
             output_dir=out,
             wiki_repo="https://github.com/x/explicit.git",
+            work_dir=tmp_path / "clone-explicit",
             push=False,
         )
         assert captured["repo_url"] == "https://github.com/x/explicit.git"
@@ -422,6 +428,62 @@ class TestCloneHostRepo:
         with pytest.raises(pg.PublishError, match="not a git repository"):
             pg.clone_host_repo("https://x/y.git", "main", work_dir, token=None)
 
+    def test_file_target_rejected(self, tmp_path):
+        # A regular file at ``work_dir`` would make ``iterdir()`` raise
+        # ``NotADirectoryError`` — verify we surface a PublishError instead.
+        work_dir = tmp_path / "not-a-dir"
+        work_dir.write_text("oops")
+        with pytest.raises(pg.PublishError, match="not a directory"):
+            pg.clone_host_repo("https://x/y.git", "main", work_dir, token=None)
+
+
+# ---------------------------------------------------------------------------
+# write_entry — symlink escape guard
+# ---------------------------------------------------------------------------
+class TestWriteEntrySymlinkGuard:
+    def test_symlinked_content_dir_rejected(self, tmp_path):
+        # Simulate a malicious host repo where ``src/content/wikis`` is a
+        # symlink to a directory outside the clone root.  Without the
+        # ``relative_to(work_root)`` check the subsequent rmtree/write would
+        # operate on the symlink target.
+        work_dir = tmp_path / "clone"
+        (work_dir / "src" / "content").mkdir(parents=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        os.symlink(outside, work_dir / "src" / "content" / "wikis")
+
+        with pytest.raises(pg.PublishError, match="outside clone root"):
+            pg.write_entry(
+                work_dir,
+                "pallets-click",
+                wiki_mdx="# X",
+                metadata={"name": "click"},
+                structure=None,
+            )
+        # And nothing was written into the symlink target.
+        assert list(outside.iterdir()) == []
+
+    def test_symlinked_slug_dir_rejected(self, tmp_path):
+        # ``src/content/wikis`` itself is a real directory but the slug
+        # already exists as a symlink pointing outside the clone — replacing
+        # it would still escape ``work_dir``.
+        work_dir = tmp_path / "clone"
+        wikis = work_dir / "src" / "content" / "wikis"
+        wikis.mkdir(parents=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        os.symlink(outside, wikis / "pallets-click")
+
+        with pytest.raises(pg.PublishError, match="outside clone root"):
+            pg.write_entry(
+                work_dir,
+                "pallets-click",
+                wiki_mdx="# X",
+                metadata={"name": "click"},
+                structure=None,
+            )
+        assert list(outside.iterdir()) == []
+
 
 # ---------------------------------------------------------------------------
 # publish() — --no-push preserves the temp work dir
@@ -435,6 +497,20 @@ class TestPublishNoPushPreservesWorkDir:
             '{"owner": "pallets", "name": "click"}'
         )
         monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+
+        # Redirect publish()'s internal ``tempfile.mkdtemp`` under ``tmp_path``
+        # so pytest cleans up the preserved temp dir after the test. Without
+        # this, ``push=False`` (which intentionally skips cleanup) would leak
+        # ``deep-wikis-clone-*`` into the system temp directory.
+        mkdtemp_dir = tmp_path / "mkdtemp-root"
+        mkdtemp_dir.mkdir()
+
+        def fake_mkdtemp(prefix: str = "tmp", **_kw: Any) -> str:
+            d = mkdtemp_dir / f"{prefix}fake"
+            d.mkdir()
+            return str(d)
+
+        monkeypatch.setattr(pg.tempfile, "mkdtemp", fake_mkdtemp)
 
         seen: dict[str, Path] = {}
 
@@ -450,3 +526,6 @@ class TestPublishNoPushPreservesWorkDir:
         # The clone target lives under a temp dir that publish() must not
         # delete when push is disabled — operators rely on it for inspection.
         assert seen["work_dir"].exists()
+        # Confirm we exercised the internal-tempdir path (not an explicit
+        # work_dir) so this test still covers the --no-push preservation.
+        assert mkdtemp_dir in seen["work_dir"].parents

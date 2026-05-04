@@ -339,6 +339,14 @@ def clone_host_repo(
     unrelated content.
     """
     if work_dir.exists():
+        # ``Path.is_dir()`` follows symlinks, which is fine here: a symlink
+        # pointing at a directory is treated like the directory it targets.
+        # We explicitly reject regular files so ``iterdir()`` (which would
+        # raise ``NotADirectoryError``) is never reached.
+        if not work_dir.is_dir():
+            raise PublishError(
+                f"Clone target exists and is not a directory: {work_dir}"
+            )
         if (work_dir / ".git").is_dir():
             _refresh_existing_clone(repo_url, branch, work_dir, token=token)
             return
@@ -372,14 +380,28 @@ def write_entry(
     """Replace ``src/content/wikis/<slug>/`` with a fresh ``index.mdx``.
 
     The ``slug`` is sanitized once more here (defense in depth) so the
-    resulting ``target_dir`` cannot escape ``CONTENT_SUBPATH``.
+    resulting ``target_dir`` cannot escape ``CONTENT_SUBPATH``.  We also
+    verify that ``base_dir`` and ``target_dir`` resolve to a path under
+    the canonical ``work_dir``: a malicious host repo could symlink
+    ``src/content/wikis`` (or any of its parents) outside the clone, and
+    without this check the subsequent ``rmtree``/``write_text`` would
+    happily operate on the symlink target.
     """
     safe_slug = _sanitize_slug(slug)
+    work_root = work_dir.resolve()
     base_dir = (work_dir / CONTENT_SUBPATH).resolve()
     target_dir = (base_dir / safe_slug).resolve()
-    # Ensure ``target_dir`` stays under ``base_dir`` even if a future
-    # ``CONTENT_SUBPATH`` change introduces symlinks or path normalization
-    # surprises.
+    for candidate in (base_dir, target_dir):
+        try:
+            candidate.relative_to(work_root)
+        except ValueError as exc:
+            raise PublishError(
+                f"Refusing to write outside clone root: {candidate} "
+                f"(work_dir={work_root})"
+            ) from exc
+    # Belt-and-braces: also reject a target that escaped ``base_dir``
+    # via slug normalization (already prevented by ``_sanitize_slug``,
+    # but cheap to keep here).
     try:
         target_dir.relative_to(base_dir)
     except ValueError as exc:
@@ -387,7 +409,7 @@ def write_entry(
             f"Refusing to write outside content collection: {target_dir}"
         ) from exc
     if target_dir.exists():
-        log.info("Replacing existing entry %s", target_dir.relative_to(work_dir.resolve()))
+        log.info("Replacing existing entry %s", target_dir.relative_to(work_root))
         shutil.rmtree(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     entry = target_dir / "index.mdx"
