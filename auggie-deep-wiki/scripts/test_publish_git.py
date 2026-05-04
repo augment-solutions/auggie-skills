@@ -529,3 +529,160 @@ class TestPublishNoPushPreservesWorkDir:
         # Confirm we exercised the internal-tempdir path (not an explicit
         # work_dir) so this test still covers the --no-push preservation.
         assert mkdtemp_dir in seen["work_dir"].parents
+
+
+
+# ---------------------------------------------------------------------------
+# derive_slug — always produces a _SAFE_SLUG_RE-compatible value
+# ---------------------------------------------------------------------------
+class TestDeriveSlugFallback:
+    """Guarantee :func:`derive_slug` never returns something that
+    :func:`_sanitize_slug` would reject — otherwise ``--publish-git``
+    would hard-fail on quirky upstream metadata.
+    """
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            {"owner": "!!!", "name": "@@@"},          # all-symbol owner+name
+            {"name": "***"},                          # all-symbol name
+            {"owner": "", "name": ""},                # empty
+            {"owner": "  ", "name": "\t\n"},          # whitespace-only
+            {"name": "🔥🚀"},                          # non-ASCII only
+        ],
+    )
+    def test_collapses_to_default_when_metadata_is_junk(self, metadata):
+        slug = pg.derive_slug(None, metadata)
+        assert slug == "wiki"
+        # And the result is acceptable to the strict sanitizer.
+        assert pg._sanitize_slug(slug) == "wiki"
+
+    def test_partially_unicode_name_keeps_ascii_part(self):
+        # Mixed ASCII + non-ASCII collapses cleanly to the ASCII subset
+        # rather than falling back to ``"wiki"``.
+        slug = pg.derive_slug(None, {"name": "café"})
+        assert slug == "caf"
+        assert pg._sanitize_slug(slug) == "caf"
+
+    def test_truncates_overlong_owner_name(self):
+        owner = "a" * 80
+        name = "b" * 80
+        slug = pg.derive_slug(None, {"owner": owner, "name": name})
+        assert len(slug) <= 100
+        # Sanity: still passes the strict guard.
+        assert pg._sanitize_slug(slug) == slug
+
+    def test_truncates_overlong_url(self):
+        url = "https://github.com/" + "x" * 200 + "/" + "y" * 200
+        slug = pg.derive_slug(url, None)
+        assert 0 < len(slug) <= 100
+        assert pg._sanitize_slug(slug) == slug
+
+    def test_safe_slug_regex_match_after_truncation(self):
+        # A slug that ends up exactly at the regex boundary (1 leading +
+        # 99 trailing chars) is still valid.
+        slug = pg._coerce_safe_slug("a" + "b" * 199)
+        assert pg._SAFE_SLUG_RE.match(slug) is not None
+        assert len(slug) == 100
+
+    def test_strips_trailing_dash_after_truncation(self):
+        # Without the rstrip the truncated slug could end with '-' which is
+        # ugly even though the regex would still match it.
+        raw = "abcd" + "!" * 100  # collapses to "abcd-...-" then truncates
+        slug = pg._coerce_safe_slug(raw)
+        assert not slug.endswith("-")
+        assert pg._SAFE_SLUG_RE.match(slug) is not None
+
+    def test_publish_does_not_raise_on_junk_metadata(
+        self, tmp_path, monkeypatch
+    ):
+        # End-to-end: junk metadata with no --slug must not hard-fail.
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "wiki.mdx").write_text("---\n# T\n---\n")
+        (out / "repo_metadata.json").write_text(
+            '{"owner": "!!!", "name": "***"}'
+        )
+        monkeypatch.setattr(
+            pg, "clone_host_repo",
+            lambda repo_url, branch, work_dir, *, token: (
+                (work_dir / "src" / "content" / "wikis").mkdir(parents=True)
+            ),
+        )
+        monkeypatch.setattr(pg, "commit_and_push", lambda *a, **kw: ("abc", False))
+
+        result = pg.publish(
+            output_dir=out,
+            wiki_repo="https://github.com/x/y.git",
+            work_dir=tmp_path / "clone",
+            push=False,
+        )
+        assert result.slug == "wiki"
+
+
+# ---------------------------------------------------------------------------
+# commit_and_push — push-rejection retry only fires on non-fast-forward
+# ---------------------------------------------------------------------------
+class TestPushRetryClassification:
+    """The retry loop must only rebase-and-retry on the canonical
+    non-fast-forward signals; protected-branch / hook rejections must
+    surface immediately so the user can act on them.
+    """
+
+    def _setup_committed_repo(self, tmp_path):
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        return work_dir
+
+    def _make_runner(self, push_stderr: str):
+        """Return a fake ``_run`` that simulates a single failing push."""
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            verb = cmd[1] if cmd[:1] == ["git"] else (cmd[3] if len(cmd) > 3 else "")
+            if verb == "diff":  # _has_staged_changes
+                return subprocess.CompletedProcess(cmd, 1, "", "")
+            if "push" in cmd:
+                return subprocess.CompletedProcess(cmd, 1, "", push_stderr)
+            return subprocess.CompletedProcess(cmd, 0, "deadbeef\n", "")
+
+        return fake_run, calls
+
+    def test_protected_branch_rejection_is_not_retried(self, tmp_path, monkeypatch):
+        fake_run, calls = self._make_runner(
+            "remote: error: GH006: Protected branch update failed for refs/heads/main.\n"
+            "remote: error: At least one approving review is required.\n"
+            "! [remote rejected] main -> main (protected branch hook declined)\n"
+            "error: failed to push some refs to 'https://github.com/x/y.git'\n"
+        )
+        monkeypatch.setattr(pg, "_run", fake_run)
+        with pytest.raises(pg.PublishError, match="git push failed"):
+            pg.commit_and_push(
+                self._setup_committed_repo(tmp_path),
+                slug="abc", branch="main", push=True, token=None,
+                author_name="x", author_email="x@y",
+            )
+        # Exactly one push attempt — no rebase loop, no further pushes.
+        push_attempts = [c for c in calls if "push" in c]
+        assert len(push_attempts) == 1
+        assert not any("pull" in c for c in calls)
+
+    def test_non_fast_forward_triggers_rebase_retry(self, tmp_path, monkeypatch):
+        fake_run, calls = self._make_runner(
+            "! [rejected] main -> main (non-fast-forward)\n"
+            "error: failed to push some refs to 'https://github.com/x/y.git'\n"
+            "hint: Updates were rejected because the tip of your current branch is behind\n"
+            "hint: its remote counterpart. Integrate the remote changes (e.g.\n"
+            "hint: 'git pull ...') before pushing again.\n"
+        )
+        monkeypatch.setattr(pg, "_run", fake_run)
+        with pytest.raises(pg.PublishError, match="after .* retries"):
+            pg.commit_and_push(
+                self._setup_committed_repo(tmp_path),
+                slug="abc", branch="main", push=True, token=None,
+                author_name="x", author_email="x@y",
+            )
+        # Each failed push is followed by a pull --rebase before retrying.
+        assert sum(1 for c in calls if "push" in c) == pg.PUSH_RETRIES
+        assert sum(1 for c in calls if "pull" in c and "--rebase" in c) == pg.PUSH_RETRIES

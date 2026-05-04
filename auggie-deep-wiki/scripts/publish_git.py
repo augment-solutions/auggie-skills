@@ -150,21 +150,53 @@ def _sanitize_slug(slug: str) -> str:
     return candidate
 
 
+_SLUG_FALLBACK = "wiki"
+# ``_SAFE_SLUG_RE`` permits up to 100 chars total (1 leading + 99 trailing).
+_SLUG_MAX_LEN = 100
+
+
+def _coerce_safe_slug(raw: str) -> str:
+    """Project ``raw`` onto :data:`_SAFE_SLUG_RE`.
+
+    Always returns a value that passes :func:`_sanitize_slug` so the
+    publish flow keeps working even when metadata is junk (empty,
+    all-symbols, very long ``owner/name``).  Used by :func:`derive_slug`
+    so callers never have to think about edge cases.
+    """
+    candidate = _SLUG_RE.sub("-", (raw or "").lower()).strip("-_")
+    if len(candidate) > _SLUG_MAX_LEN:
+        candidate = candidate[:_SLUG_MAX_LEN].rstrip("-_")
+    if not candidate:
+        return _SLUG_FALLBACK
+    # Post-strip the first char is guaranteed alphanumeric (``-`` and ``_``
+    # were stripped above and ``_SLUG_RE`` collapsed everything else), so
+    # ``candidate`` matches ``_SAFE_SLUG_RE`` by construction.
+    return candidate
+
+
 def derive_slug(repo_url: str | None, metadata: dict[str, Any] | None) -> str:
-    """Stable, lowercase slug for a repo. ``owner-name`` when possible."""
+    """Stable, lowercase slug for a repo. ``owner-name`` when possible.
+
+    The result is guaranteed to match :data:`_SAFE_SLUG_RE` (and therefore
+    to pass :func:`_sanitize_slug`) so ``--publish-git`` never hard-fails
+    on quirky upstream metadata; junk inputs collapse to
+    ``"wiki"`` and overlong inputs are truncated to
+    :data:`_SLUG_MAX_LEN` characters.
+    """
+    raw = ""
     if metadata:
         owner = str(metadata.get("owner") or "").strip().lower()
         name = str(metadata.get("name") or metadata.get("repo_name") or "").strip().lower()
         if owner and name:
-            return _SLUG_RE.sub("-", f"{owner}-{name}").strip("-")
-        if name:
-            return _SLUG_RE.sub("-", name).strip("-")
-    if repo_url:
+            raw = f"{owner}-{name}"
+        elif name:
+            raw = name
+    if not raw and repo_url:
         clean = repo_url.rstrip("/").removesuffix(".git")
         parts = clean.split("/")
         if len(parts) >= 2:
-            return _SLUG_RE.sub("-", f"{parts[-2]}-{parts[-1]}".lower()).strip("-")
-    return "wiki"
+            raw = f"{parts[-2]}-{parts[-1]}".lower()
+    return _coerce_safe_slug(raw)
 
 
 def _yaml_scalar(value: Any) -> str:
@@ -481,7 +513,16 @@ def commit_and_push(
             log.info("Pushed %s to origin/%s", sha[:8] if sha else "?", branch)
             return sha, True
         err = _redact((proc.stderr or "") + (proc.stdout or ""))
-        if "non-fast-forward" in err or "fetch first" in err or "rejected" in err:
+        # Only retry on the canonical non-fast-forward signals git emits when
+        # the remote tip moved between fetch and push.  A bare ``"rejected"``
+        # match would also fire on protected-branch / pre-receive hook
+        # rejections, which rebase-and-retry cannot fix - those should
+        # surface to the user immediately.
+        if (
+            "non-fast-forward" in err
+            or "fetch first" in err
+            or "tip of your current branch is behind" in err
+        ):
             log.warning(
                 "Push rejected (concurrent update?); rebasing and retrying [%d/%d]",
                 attempt,
