@@ -20,11 +20,11 @@ auggie-deep-wiki/
 │   ├── generate_wiki.py           # stdlib-only Python orchestrator
 │   ├── build_static.py            # bundle wiki.mdx into a self-contained index.html
 │   ├── preview.py                 # stdlib-only HTTP server for viewing wiki.mdx
-│   ├── publish_vercel.py          # Optional: publish to Vercel via Astro
+│   ├── publish_git.py             # Optional: publish to a Git-backed Astro repo
 │   └── validate_mdx.mjs           # Optional Node MDX validator
 ├── preview/
 │   └── index.html                 # Viewer template (marked + mermaid via CDN)
-├── astro-template/                # Astro site copied to --vercel-site-dir on first publish
+├── astro-template/                # Reference Astro site for bootstrapping a host repo
 │   ├── package.json
 │   ├── astro.config.mjs
 │   └── src/
@@ -140,118 +140,111 @@ dynamically.
 Press `Ctrl+C` to stop. Both modes need only Python 3.10+ and a browser
 with internet access for the CDN scripts.
 
-## Publishing to Vercel (optional)
+## Publishing to a Git-backed Astro site (optional)
 
 By default the skill writes only to the local filesystem. Pass
-`--publish-vercel` (or ask the agent to "publish to Vercel") to also
-publish the result to Vercel via a small Astro site bundled with this
-skill.
+`--publish-git` (or ask the agent to "publish this wiki") to also
+push the result into a host Astro repository. Any static-site host
+that auto-deploys on push (Vercel, Netlify, Cloudflare Pages, GitHub
+Pages, etc.) will then pick up the new wiki without further action.
 
 ```bash
+export DEEP_WIKIS_GIT_REPO=https://github.com/<org>/deep-wikis.git
 python3 scripts/generate_wiki.py \
   https://github.com/pallets/click \
   --output-dir ./output/click \
-  --publish-vercel \
-  --vercel-prod
+  --publish-git
 ```
 
 What happens:
 
-1. `vercel whoami` is checked. If the CLI is missing or unauthenticated
-   the publish step aborts with a clear error — the local
-   `output/click/` directory is still produced.
-2. An Astro site is created at `--vercel-site-dir` (default
-   `~/.augment/deep-wiki-site`) on first run, and `npm install` runs
-   once. Subsequent publishes reuse the same site.
-3. `wiki.mdx` + `repo_metadata.json` are converted into a content
-   collection entry at `<site-dir>/src/content/wikis/<slug>/index.mdx`.
-4. `vercel deploy` (preview by default; `--vercel-prod` for production)
-   runs from the site dir. The deployment URL is printed on success.
+1. `git clone --depth=1 --branch <branch> $DEEP_WIKIS_GIT_REPO` into a
+   temp directory. If `GITHUB_TOKEN` (or `GH_TOKEN`) is set, it is
+   passed via an `Authorization: Bearer …` header for that single
+   invocation — never written to `.git/config` or logs.
+2. `wiki.mdx` + `repo_metadata.json` are converted into an Astro
+   content-collection entry at
+   `src/content/wikis/<slug>/index.mdx`. Any existing directory for
+   the same slug is replaced atomically so stale auxiliary files from
+   a previous run don't linger.
+3. The change is committed with the message
+   `deep-wiki: update <slug>` and pushed to `origin <branch>`. If
+   the push is rejected because another session pushed concurrently,
+   the script `pull --rebase`s and retries up to 3 times.
+4. The host's CI/CD (Vercel auto-deploy on push, GitHub Pages action,
+   etc.) rebuilds the unified site.
 
-The generated site has:
+### Setting up the host repository (one-time)
 
-- `/` — landing page listing every published wiki, sorted by
-  last-updated date.
-- `/wikis/<slug>/` — one page per wiki, rendered through
-  `WikiLayout.astro`. Mermaid blocks are rendered client-side via
-  `mermaid@11` from a CDN, mirroring the static viewer.
+The skill ships **no default host repo** so each team can self-host.
+To bootstrap your own:
 
-### Preparing your Vercel account
-
-One-time setup (per workstation / per Vercel account):
-
-1. **Create a Vercel account** at <https://vercel.com/signup>. The
-   Hobby plan is fine for personal use; Pro/Enterprise also work.
-2. **Install the Vercel CLI** globally:
+1. Create a new GitHub (or GitLab/Bitbucket) repo, e.g.
+   `<org>/deep-wikis`.
+2. Copy `astro-template/` from this skill into the empty repo:
    ```bash
-   npm install -g vercel
-   vercel --version
+   cp -R ~/.augment/skills/auggie-deep-wiki/astro-template/* /path/to/cloned-host-repo/
+   cd /path/to/cloned-host-repo
+   git add -A && git commit -m "Initial Astro scaffold"
+   git push origin main
    ```
-3. **Authenticate** the CLI:
+3. Wire it to your static-site host. For Vercel: create a project
+   from the repo on <https://vercel.com/new> — Astro is auto-detected
+   and no environment variables are required.
+4. Export the URL so the skill can find it:
    ```bash
-   vercel login
-   vercel whoami    # should print your email/username
+   echo 'export DEEP_WIKIS_GIT_REPO=https://github.com/<org>/deep-wikis.git' >> ~/.zshrc
    ```
-4. *(Optional, recommended)* **Pre-create the Vercel project** so the
-   first publish doesn't prompt interactively:
-   - Pick any repository or empty template on the Vercel dashboard, or
-   - Skip this step and let `vercel deploy` create the project on first
-     run (it asks "Set up and deploy?" → "Y", then "Link to existing
-     project?" → "N", then "What's your project's name?" → e.g.
-     `deep-wikis`, then "In which directory is your code located?" →
-     `./`).
-5. *(Optional)* **Link the Astro site dir** explicitly so future runs
-   don't prompt:
-   ```bash
-   cd ~/.augment/deep-wiki-site
-   vercel link        # pick the project you just created
-   ```
-6. *(Optional)* **Configure a custom domain** in the Vercel dashboard
-   (Project → Settings → Domains). Once attached, every wiki is
-   reachable at `https://<your-domain>/wikis/<slug>/`.
 
-### Hosting multiple wikis on one Astro site
+### Authentication
 
-The skill is designed for this from day one:
+| Environment            | How to authenticate                                  |
+| ---------------------- | ---------------------------------------------------- |
+| Local (HTTPS clone)    | Set `GITHUB_TOKEN` (PAT with `contents: write`), or rely on git's credential helper / OS keychain |
+| Local (SSH clone)      | Use `git@github.com:<org>/deep-wikis.git` and the SSH key already configured for git |
+| Poseidon / CI sandbox  | `GITHUB_TOKEN` is typically already exported; just set `DEEP_WIKIS_GIT_REPO` |
 
-- Every published wiki becomes a directory under
-  `<site-dir>/src/content/wikis/<slug>/`. Existing entries are never
-  overwritten, only the slug being published is replaced.
-- The slug is derived from the cloned repo: `<owner>-<repo>` (e.g.
-  `pallets-click`, `pallets-flask`). Override with `--vercel-slug` if
-  you want a custom path.
-- Astro's content collection picks up every entry at build time;
-  `getStaticPaths()` produces one static page per wiki under
-  `/wikis/<slug>/`, plus a single landing page at `/` listing them all.
-- Because the site dir is reused across publishes, the same Vercel
-  project receives deployments for every wiki. There is no per-wiki
-  Vercel project to manage.
+The skill never persists or echoes the token.
 
-To inspect or remove a published wiki:
+### Hosting multiple wikis on one site
+
+This is the default and only mode:
+
+- Every published wiki becomes `src/content/wikis/<slug>/index.mdx`
+  in the host repo. The same slug is replaced in-place on re-publish;
+  every other wiki is left untouched.
+- The slug is derived from the cloned repo (`<owner>-<repo>`).
+  Override with `--wiki-slug` for a custom path.
+- Astro's content collection picks every entry up at build time
+  and produces `/`, `/wikis/<slug>/` routes — one static page per
+  wiki plus a landing page that lists them all.
+
+Inspect or remove a published wiki by editing the host repo directly:
 
 ```bash
-ls ~/.augment/deep-wiki-site/src/content/wikis/
+git clone https://github.com/<org>/deep-wikis.git
+cd deep-wikis
+ls src/content/wikis/
 # pallets-click  pallets-flask  some-other-repo
-
-# Remove a wiki and re-deploy:
-rm -rf ~/.augment/deep-wiki-site/src/content/wikis/some-other-repo
-cd ~/.augment/deep-wiki-site && vercel deploy --prod --yes
+git rm -r src/content/wikis/some-other-repo
+git commit -m "deep-wiki: remove some-other-repo" && git push
 ```
 
 ### Manual publish (without re-running auggie)
 
-`publish_vercel.py` can also be invoked directly against an existing
-output directory:
+`publish_git.py` can be invoked directly against an existing output
+directory:
 
 ```bash
-python3 scripts/publish_vercel.py ./output/click \
-  --slug pallets-click \
-  --prod
+python3 scripts/publish_git.py \
+  --output-dir ./output/click \
+  --wiki-repo https://github.com/<org>/deep-wikis.git \
+  --slug pallets-click
 ```
 
-Use `--skip-deploy` to write the content entry but stop before invoking
-`vercel deploy` (handy for inspecting the generated MDX), or
-`--skip-install` when `node_modules` is already populated.
+Use `--no-push` to commit into the temp clone but stop before pushing
+(handy for inspecting the generated MDX), or `--keep-work-dir
+--work-dir /tmp/deep-wikis-clone` to preserve the clone for review.
 
 
 
@@ -265,13 +258,15 @@ Just ask Auggie / Claude / your IDE agent something like:
 The agent will discover this skill via `SKILL.md`, confirm prerequisites, and
 invoke `scripts/generate_wiki.py` for you.
 
-To also publish the result to Vercel, mention it explicitly:
+To also publish the result to your team's site, mention it explicitly:
 
 > Generate a deep wiki for `https://github.com/pallets/click` and
-> **publish it to Vercel**.
+> **publish it to our deep-wikis site**.
 
-The agent passes `--publish-vercel` to the orchestrator, which runs the
-default static output first and then the optional publish pipeline.
+The agent passes `--publish-git` to the orchestrator (with
+`$DEEP_WIKIS_GIT_REPO` already exported in your environment), which
+runs the default static output first and then the optional publish
+pipeline.
 
 ## Pipeline at a glance
 
@@ -317,10 +312,11 @@ in `scripts/generate_wiki.py`.
 | MDX validation skipped                      | `cd ~/.augment/skills/auggie-deep-wiki && npm i`|
 | Mermaid diagram doesn't render in your CMS  | The CMS may need a remark/rehype plugin —       |
 |                                             | the MDX itself compiles fine                    |
-| `Vercel CLI not found on PATH`              | `npm i -g vercel` (Node.js 20+ required)        |
-| `Vercel CLI is installed but not authenticated` | `vercel login` then re-run with `--publish-vercel` |
-| `vercel deploy` prompts for project setup   | Either accept the prompts on first run, or pre-link with `cd ~/.augment/deep-wiki-site && vercel link` |
-| Wiki appears at the wrong URL on Vercel     | Override the slug with `--vercel-slug <slug>` (default is `<owner>-<repo>`) |
+| `No host repo configured`                   | Pass `--wiki-repo …` or export `DEEP_WIKIS_GIT_REPO` |
+| `git push failed: Authentication failed`    | Set `GITHUB_TOKEN` (PAT with `contents: write`) for HTTPS, or use the SSH form of the URL with a configured key |
+| Push rejected, retry message in logs        | Concurrent publish from another session — the script rebases and retries up to 3 times automatically; if it still fails, rerun |
+| Wiki appears at the wrong URL               | Override the slug with `--wiki-slug <slug>` (default is `<owner>-<repo>`) |
+| Want to preview before pushing              | Use `--no-push --keep-wiki-work-dir --wiki-work-dir /tmp/deep-wikis-clone` and inspect the commit |
 
 ## License
 
