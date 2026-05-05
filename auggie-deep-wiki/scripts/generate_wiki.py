@@ -600,14 +600,25 @@ def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> bool:
     # but they are not degraded outcomes from the user's perspective, so
     # branching on the inferred combination would over-report.
     if result.tooling_missing:
+        # ``publish()`` bails before staging in this branch, so the
+        # entry is only on the working tree.  Manual recovery requires
+        # ``git add`` + ``git commit`` + ``git push`` after the build;
+        # scope the ``git add`` to the slug directory so validation
+        # artifacts (``node_modules/``, ``package-lock.json``, ``.astro/``,
+        # ``dist/``) don't end up in the publish commit.
+        slug_path = f"src/content/wikis/{result.slug}"
         log.warning(
             "Published %s locally to %s but DID NOT push: build "
-            "validation %s. Install Node.js + run `npm install && "
-            "npm run build` in the host clone before pushing manually, "
-            "or re-run with --skip-build-validation.",
+            "validation %s. Install Node.js, then in the host clone "
+            "run: `npm install && npm run build && git add -- %s && "
+            "git commit -m 'deep-wiki: update %s' && git push origin %s`. "
+            "Or re-run with --skip-build-validation to bypass.",
             result.slug,
             result.entry_path,
             result.validation_skipped_reason,
+            slug_path,
+            result.slug,
+            result.branch,
         )
         return False
     log.info(

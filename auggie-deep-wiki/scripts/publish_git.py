@@ -553,6 +553,41 @@ def _tail_output(text: str, *, limit: int = BUILD_OUTPUT_TAIL_LINES) -> str:
     return "...\n" + "\n".join(lines[-limit:]).rstrip()
 
 
+def _format_proc_tail(
+    proc: subprocess.CompletedProcess,
+    *,
+    limit: int = BUILD_OUTPUT_TAIL_LINES,
+) -> str:
+    """Render the captured output of a failed subprocess for error reports.
+
+    Tails ``stderr`` and ``stdout`` independently and labels each section.
+    Concatenating the two streams before truncation lets a long
+    ``stdout`` buffer (e.g. progress noise from ``npm install`` or a
+    chatty Astro build) push the actual error \u2014 typically on
+    ``stderr`` \u2014 past the truncation window, leaving the operator
+    with output that doesn't explain the failure.  Tailing each stream
+    on its own preserves up to ``limit`` lines from both.
+
+    Both streams are ``_redact``-ed before being rendered.
+    """
+    err = (proc.stderr or "").rstrip()
+    out = (proc.stdout or "").rstrip()
+    parts: list[str] = []
+    if err:
+        parts.append(
+            f"--- last {limit} lines of stderr ---\n"
+            f"{_tail_output(_redact(err), limit=limit)}"
+        )
+    if out:
+        parts.append(
+            f"--- last {limit} lines of stdout ---\n"
+            f"{_tail_output(_redact(out), limit=limit)}"
+        )
+    if not parts:
+        return "(no output captured)"
+    return "\n".join(parts)
+
+
 # File written next to ``node_modules/`` recording the manifest hash that
 # was installed.  Used to detect ``package.json`` / ``package-lock.json``
 # drift across re-runs of a persistent ``--wiki-work-dir``: if the host
@@ -638,7 +673,7 @@ def _npm_install(work_dir: Path, *, timeout: int = NPM_INSTALL_TIMEOUT) -> None:
         raise PublishError(
             "npm install failed in the host repo clone "
             f"({work_dir}); cannot validate astro build:\n"
-            f"{_tail_output(_redact((proc.stderr or '') + (proc.stdout or '')))}"
+            f"{_format_proc_tail(proc)}"
         )
     # Record the manifest hash *only* on success so a partial install
     # cannot be mistaken for a complete one on the next run.
@@ -694,12 +729,10 @@ def validate_astro_build(
         timeout=build_timeout,
     )
     if proc.returncode != 0:
-        combined = _redact((proc.stderr or "") + (proc.stdout or ""))
         raise PublishError(
             "astro build failed against the new entry; refusing to push. "
             "Inspect the entry, fix the source, and re-run.\n"
-            f"--- last {BUILD_OUTPUT_TAIL_LINES} lines of build output ---\n"
-            f"{_tail_output(combined)}"
+            f"{_format_proc_tail(proc)}"
         )
     log.info("astro build OK")
 
@@ -1077,14 +1110,27 @@ def main(argv: list[str] | None = None) -> int:
     # nothing to push, or ``--no-push`` dry runs, both of which also
     # report ``validation_skipped + not pushed``.
     if result.tooling_missing:
+        # The publisher bails *before* ``commit_and_push`` in this
+        # branch, so the entry is only on the working tree -- it's not
+        # staged, not committed, and not pushed.  Manual recovery has
+        # to run all four git steps (add + commit + push) after the
+        # build, not just the push.  Scope the ``git add`` to the slug
+        # directory so build artifacts (``node_modules/``,
+        # ``package-lock.json``, ``.astro/``, ``dist/``) created by the
+        # validation step don't sneak into the publish commit.
+        slug_path = f"{CONTENT_SUBPATH.as_posix()}/{result.slug}"
         log.error(
             "Build validation skipped (%s) and push aborted. The new "
             "entry is at %s; install Node.js, then run "
-            "`cd <work-dir> && npm install && npm run build && git push` "
-            "to publish manually, or pass --skip-build-validation to "
-            "bypass on the next run.",
+            "`cd <work-dir> && npm install && npm run build && "
+            "git add -- %s && git commit -m 'deep-wiki: update %s' && "
+            "git push origin %s` to publish manually, or pass "
+            "--skip-build-validation to bypass on the next run.",
             result.validation_skipped_reason,
             result.entry_path,
+            slug_path,
+            result.slug,
+            result.branch,
         )
         return 3
     log.info(

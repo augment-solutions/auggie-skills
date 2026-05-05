@@ -410,6 +410,71 @@ class TestRedact:
             assert needle not in redacted
 
 
+# ---------------------------------------------------------------------------
+# _format_proc_tail — independent stderr/stdout tailing for failure reports
+# ---------------------------------------------------------------------------
+class TestFormatProcTail:
+    """``_format_proc_tail`` must surface the actual error even when one
+    stream dominates the captured output.  Concatenating ``stderr`` and
+    ``stdout`` before truncation -- which the previous helper did --
+    let a chatty ``npm install`` / ``astro build`` ``stdout`` push the
+    real error (almost always on ``stderr``) past the truncation
+    window, leaving operators staring at progress noise.
+    """
+
+    def _proc(self, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(
+            args=["x"], returncode=1, stdout=stdout, stderr=stderr,
+        )
+
+    def test_long_stdout_does_not_hide_stderr(self):
+        # ``npm install`` reliably prints hundreds of progress lines on
+        # stdout while the actual error sits on stderr.  The helper
+        # must show both.
+        noisy_stdout = "\n".join(f"npm sill progress {i}" for i in range(500))
+        real_error = "npm ERR! code E401\nnpm ERR! 401 Unauthorized"
+        out = pg._format_proc_tail(self._proc(stdout=noisy_stdout, stderr=real_error))
+        assert "npm ERR! code E401" in out
+        assert "npm ERR! 401 Unauthorized" in out
+        # Stream labels make the section boundaries explicit so the
+        # operator can see which side the error came from.
+        assert "stderr" in out
+        assert "stdout" in out
+
+    def test_each_stream_is_independently_truncated(self):
+        # Both streams over the limit must each contribute up to the
+        # tail limit -- not a shared budget.
+        big_stdout = "\n".join(f"out-{i}" for i in range(pg.BUILD_OUTPUT_TAIL_LINES * 3))
+        big_stderr = "\n".join(f"err-{i}" for i in range(pg.BUILD_OUTPUT_TAIL_LINES * 3))
+        out = pg._format_proc_tail(self._proc(stdout=big_stdout, stderr=big_stderr))
+        # Last lines of each stream are present.
+        assert f"out-{pg.BUILD_OUTPUT_TAIL_LINES * 3 - 1}" in out
+        assert f"err-{pg.BUILD_OUTPUT_TAIL_LINES * 3 - 1}" in out
+        # Earliest lines were truncated from both.
+        assert "out-0\n" not in out
+        assert "err-0\n" not in out
+
+    def test_credentials_redacted_in_both_streams(self):
+        out = pg._format_proc_tail(self._proc(
+            stdout="//registry.example.com/:_authToken=ghp_stdout_secret\n",
+            stderr="Authorization: Bearer ghp_stderr_secret\n",
+        ))
+        assert "ghp_stdout_secret" not in out
+        assert "ghp_stderr_secret" not in out
+
+    def test_stdout_only_emits_only_stdout_section(self):
+        out = pg._format_proc_tail(self._proc(stdout="just stdout"))
+        assert "stdout" in out
+        # No empty "stderr" section.
+        assert "stderr" not in out
+
+    def test_no_output_falls_back_to_placeholder(self):
+        out = pg._format_proc_tail(self._proc())
+        # An empty subprocess output should produce *something* the
+        # operator can grep for instead of a silent blank line.
+        assert out.strip() != ""
+
+
 class TestRunHelper:
     def test_timeout_becomes_publish_error(self):
         def fake_run(*args, **kwargs):
@@ -1259,10 +1324,14 @@ class TestCliExitCodes:
         ])
         assert rc == 0
 
-    def test_tooling_missing_returns_three(self, tmp_path, monkeypatch):
+    def test_tooling_missing_returns_three(self, tmp_path, monkeypatch, caplog):
         """When push was *requested* but tooling was missing the CLI
         returns 3 so callers can distinguish "fix your env" from
-        either success (0) or a hard failure (1).
+        either success (0) or a hard failure (1).  The recovery hint
+        must include all four manual git steps (build + add + commit
+        + push), not just ``git push`` -- the publisher bails *before*
+        ``commit_and_push`` in this branch, so the entry is on the
+        working tree only.
         """
         out = self._setup(tmp_path, monkeypatch)
         monkeypatch.setattr(
@@ -1276,8 +1345,21 @@ class TestCliExitCodes:
                 tooling_missing=True,
             ),
         )
-        rc = pg.main(["--output-dir", str(out)])
+        with caplog.at_level("ERROR", logger="auggie-deep-wiki.publish-git"):
+            rc = pg.main(["--output-dir", str(out)])
         assert rc == 3
+        recovery = "\n".join(r.getMessage() for r in caplog.records)
+        # All four steps must be in the hint, in order, scoped to the
+        # slug directory so build artifacts don't sneak into the commit.
+        assert "npm install" in recovery
+        assert "npm run build" in recovery
+        assert "git add -- src/content/wikis/o-n" in recovery
+        assert "git commit" in recovery
+        assert "git push origin main" in recovery
+        # And in the right order.
+        assert recovery.index("npm install") < recovery.index("git add")
+        assert recovery.index("git add") < recovery.index("git commit")
+        assert recovery.index("git commit") < recovery.index("git push")
 
     def test_skip_validation_idempotent_returns_zero(
         self, tmp_path, monkeypatch,
