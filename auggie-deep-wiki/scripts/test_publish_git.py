@@ -261,8 +261,13 @@ class TestPublish:
         # Use an explicit work_dir under tmp_path so pytest cleans up after
         # the test; otherwise publish() with ``push=False`` would leave a
         # ``deep-wikis-clone-*`` dir in the system temp directory.
+        # ``skip_build_validation`` keeps these tests focused on the
+        # arg/env wiring; ``validate_astro_build`` has its own coverage.
         result = pg.publish(
-            output_dir=out, work_dir=tmp_path / "clone-env", push=False
+            output_dir=out,
+            work_dir=tmp_path / "clone-env",
+            push=False,
+            skip_build_validation=True,
         )
         assert captured["repo_url"] == "https://github.com/x/y.git"
         assert captured["branch"] == "main"
@@ -289,6 +294,7 @@ class TestPublish:
             wiki_repo="https://github.com/x/explicit.git",
             work_dir=tmp_path / "clone-explicit",
             push=False,
+            skip_build_validation=True,
         )
         assert captured["repo_url"] == "https://github.com/x/explicit.git"
 
@@ -521,7 +527,7 @@ class TestPublishNoPushPreservesWorkDir:
         monkeypatch.setattr(pg, "clone_host_repo", fake_clone)
         monkeypatch.setattr(pg, "commit_and_push", lambda *a, **kw: ("abc", False))
 
-        result = pg.publish(output_dir=out, push=False)
+        result = pg.publish(output_dir=out, push=False, skip_build_validation=True)
         assert result.pushed is False
         # The clone target lives under a temp dir that publish() must not
         # delete when push is disabled — operators rely on it for inspection.
@@ -616,6 +622,7 @@ class TestDeriveSlugFallback:
             wiki_repo="https://github.com/x/y.git",
             work_dir=tmp_path / "clone",
             push=False,
+            skip_build_validation=True,
         )
         assert result.slug == "wiki"
 
@@ -686,3 +693,243 @@ class TestPushRetryClassification:
         # Each failed push is followed by a pull --rebase before retrying.
         assert sum(1 for c in calls if "push" in c) == pg.PUSH_RETRIES
         assert sum(1 for c in calls if "pull" in c and "--rebase" in c) == pg.PUSH_RETRIES
+
+
+# ---------------------------------------------------------------------------
+# validate_astro_build — tooling missing / install / build failure / success
+# ---------------------------------------------------------------------------
+class TestValidateAstroBuild:
+    """Cover the three observable outcomes of ``validate_astro_build``:
+    tooling missing (skip-with-summary), build failure (PublishError,
+    no push), and success (no raise).
+    """
+
+    def _seed_host_repo(self, tmp_path: Path) -> Path:
+        target = tmp_path / "deep-wikis"
+        target.mkdir()
+        (target / "package.json").write_text('{"name": "x"}')
+        return target
+
+    def test_missing_node_raises_build_tooling_missing(self, tmp_path, monkeypatch):
+        # Both ``node`` and ``npm`` absent from PATH.
+        monkeypatch.setattr(pg.shutil, "which", lambda _: None)
+        target = self._seed_host_repo(tmp_path)
+        with pytest.raises(pg.BuildToolingMissing) as excinfo:
+            pg.validate_astro_build(target)
+        msg = str(excinfo.value)
+        assert "node" in msg and "npm" in msg
+
+    def test_only_npm_missing_raises_build_tooling_missing(self, tmp_path, monkeypatch):
+        # ``node`` present, ``npm`` missing — still a skip case.
+        monkeypatch.setattr(
+            pg.shutil, "which", lambda tool: "/usr/local/bin/node" if tool == "node" else None
+        )
+        with pytest.raises(pg.BuildToolingMissing) as excinfo:
+            pg.validate_astro_build(self._seed_host_repo(tmp_path))
+        msg = str(excinfo.value)
+        # Only ``npm`` should be flagged as missing on the PATH report;
+        # the ``node`` token may still appear in the install hint.
+        path_line = msg.split("PATH:", 1)[1]
+        assert "npm" in path_line
+        assert "node" not in path_line.split("(", 1)[0]
+
+    def test_missing_package_json_raises_publish_error(self, tmp_path, monkeypatch):
+        # Tooling present but the host repo isn't an Astro project.
+        monkeypatch.setattr(pg.shutil, "which", lambda _: "/usr/local/bin/" + _)
+        target = tmp_path / "deep-wikis"
+        target.mkdir()
+        with pytest.raises(pg.PublishError, match="no package.json"):
+            pg.validate_astro_build(target)
+
+    def test_npm_install_runs_when_node_modules_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pg.shutil, "which", lambda _: "/usr/local/bin/" + _)
+        target = self._seed_host_repo(tmp_path)
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(pg, "_run", fake_run)
+        pg.validate_astro_build(target)
+
+        # Expect `npm install ...` followed by `npm run build ...`.
+        assert calls[0][:2] == ["npm", "install"]
+        assert ["npm", "run", "build"] == calls[1][:3]
+
+    def test_npm_install_skipped_when_node_modules_exists(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pg.shutil, "which", lambda _: "/usr/local/bin/" + _)
+        target = self._seed_host_repo(tmp_path)
+        (target / "node_modules").mkdir()
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(pg, "_run", fake_run)
+        pg.validate_astro_build(target)
+
+        # Only `npm run build` — no `npm install` call.
+        assert all(c[:2] != ["npm", "install"] for c in calls)
+        assert any(c[:3] == ["npm", "run", "build"] for c in calls)
+
+    def test_npm_install_failure_becomes_publish_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pg.shutil, "which", lambda _: "/usr/local/bin/" + _)
+        target = self._seed_host_repo(tmp_path)
+
+        def fake_run(cmd, **kw):
+            if cmd[:2] == ["npm", "install"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "EACCES denied")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(pg, "_run", fake_run)
+        with pytest.raises(pg.PublishError, match="npm install failed"):
+            pg.validate_astro_build(target)
+
+    def test_build_failure_becomes_publish_error_with_tail(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pg.shutil, "which", lambda _: "/usr/local/bin/" + _)
+        target = self._seed_host_repo(tmp_path)
+        (target / "node_modules").mkdir()
+        long_err = "\n".join(f"line-{i}" for i in range(200))
+
+        def fake_run(cmd, **kw):
+            if cmd[:3] == ["npm", "run", "build"]:
+                return subprocess.CompletedProcess(cmd, 1, long_err, "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(pg, "_run", fake_run)
+        with pytest.raises(pg.PublishError) as excinfo:
+            pg.validate_astro_build(target)
+        msg = str(excinfo.value)
+        assert "astro build failed" in msg
+        # Last lines should be present, earliest should be elided.
+        assert "line-199" in msg
+        assert "line-0" not in msg
+
+
+
+# ---------------------------------------------------------------------------
+# publish() integration with build validation
+# ---------------------------------------------------------------------------
+class TestPublishBuildValidationIntegration:
+    """Verify ``publish()`` wires up ``validate_astro_build`` correctly:
+    skip-with-summary on missing tooling, hard-fail on build error, and
+    bypass when ``skip_build_validation=True``.
+    """
+
+    def _make_output(self, tmp_path: Path) -> Path:
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "wiki.mdx").write_text("---\n# T\n---\n")
+        (out / "repo_metadata.json").write_text(
+            '{"owner": "pallets", "name": "click"}'
+        )
+        return out
+
+    def _seed_clone(self, monkeypatch):
+        """Stub ``clone_host_repo`` to set up the minimum host-repo layout
+        ``write_entry`` and ``validate_astro_build`` need.
+        """
+        def fake_clone(repo_url, branch, work_dir, *, token):
+            (work_dir / "src" / "content" / "wikis").mkdir(parents=True)
+            (work_dir / "package.json").write_text('{"name": "x"}')
+        monkeypatch.setattr(pg, "clone_host_repo", fake_clone)
+
+    def test_skip_flag_bypasses_validation_and_pushes(self, tmp_path, monkeypatch):
+        out = self._make_output(tmp_path)
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        self._seed_clone(monkeypatch)
+
+        validate_called = {"count": 0}
+
+        def fake_validate(*a, **kw):
+            validate_called["count"] += 1
+
+        monkeypatch.setattr(pg, "validate_astro_build", fake_validate)
+        monkeypatch.setattr(pg, "commit_and_push", lambda *a, **kw: ("abc", True))
+
+        result = pg.publish(
+            output_dir=out,
+            work_dir=tmp_path / "clone",
+            skip_build_validation=True,
+        )
+        assert validate_called["count"] == 0
+        assert result.pushed is True
+        assert result.validation_skipped is True
+        assert "bypassed" in (result.validation_skipped_reason or "")
+
+    def test_missing_tooling_skips_push_and_preserves_workdir(
+        self, tmp_path, monkeypatch
+    ):
+        out = self._make_output(tmp_path)
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        self._seed_clone(monkeypatch)
+
+        def raise_missing(*a, **kw):
+            raise pg.BuildToolingMissing("required build tooling not found on PATH: node, npm")
+
+        commit_called = {"count": 0}
+
+        def fake_commit(*a, **kw):
+            commit_called["count"] += 1
+            return ("abc", True)
+
+        monkeypatch.setattr(pg, "validate_astro_build", raise_missing)
+        monkeypatch.setattr(pg, "commit_and_push", fake_commit)
+
+        clone_dir = tmp_path / "clone"
+        result = pg.publish(output_dir=out, work_dir=clone_dir)
+
+        # No commit, no push, but the entry was written and the dir lives.
+        assert commit_called["count"] == 0
+        assert result.pushed is False
+        assert result.validation_skipped is True
+        assert "node" in (result.validation_skipped_reason or "")
+        assert clone_dir.is_dir()
+
+    def test_build_failure_propagates_and_skips_push(self, tmp_path, monkeypatch):
+        out = self._make_output(tmp_path)
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        self._seed_clone(monkeypatch)
+
+        def raise_build_error(*a, **kw):
+            raise pg.PublishError("astro build failed: bad indentation")
+
+        commit_called = {"count": 0}
+
+        def fake_commit(*a, **kw):
+            commit_called["count"] += 1
+            return ("abc", True)
+
+        monkeypatch.setattr(pg, "validate_astro_build", raise_build_error)
+        monkeypatch.setattr(pg, "commit_and_push", fake_commit)
+
+        with pytest.raises(pg.PublishError, match="astro build failed"):
+            pg.publish(output_dir=out, work_dir=tmp_path / "clone")
+        assert commit_called["count"] == 0
+
+    def test_validation_success_proceeds_to_push(self, tmp_path, monkeypatch):
+        out = self._make_output(tmp_path)
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        self._seed_clone(monkeypatch)
+
+        validate_called = {"count": 0}
+        commit_called = {"count": 0}
+
+        def fake_validate(*a, **kw):
+            validate_called["count"] += 1
+
+        def fake_commit(*a, **kw):
+            commit_called["count"] += 1
+            return ("deadbeef", True)
+
+        monkeypatch.setattr(pg, "validate_astro_build", fake_validate)
+        monkeypatch.setattr(pg, "commit_and_push", fake_commit)
+
+        result = pg.publish(output_dir=out, work_dir=tmp_path / "clone")
+        assert validate_called["count"] == 1
+        assert commit_called["count"] == 1
+        assert result.pushed is True
+        assert result.validation_skipped is False
+        assert result.validation_skipped_reason is None

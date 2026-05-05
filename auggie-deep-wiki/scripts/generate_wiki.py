@@ -588,7 +588,19 @@ def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> None:
         push=not args.no_push,
         work_dir=work_dir,
         keep_work_dir=args.keep_wiki_work_dir,
+        skip_build_validation=args.skip_build_validation,
     )
+    if result.validation_skipped and not result.pushed:
+        log.warning(
+            "Published %s locally to %s but DID NOT push: build "
+            "validation %s. Install Node.js + run `npm install && "
+            "npm run build` in the host clone before pushing manually, "
+            "or re-run with --skip-build-validation.",
+            result.slug,
+            result.entry_path,
+            result.validation_skipped_reason,
+        )
+        return
     log.info(
         "Published %s -> %s (commit=%s pushed=%s)",
         result.slug,
@@ -799,6 +811,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--no-push",
         action="store_true",
         help="Commit locally only; do not push the host repo (dry-run)",
+    )
+    p.add_argument(
+        "--skip-build-validation",
+        action="store_true",
+        help=(
+            "Skip the pre-push `astro build` validation against the host "
+            "repo clone. Use only when CI does the same check; otherwise "
+            "broken MDX/YAML can land on the deployed site."
+        ),
     )
     p.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
     return p

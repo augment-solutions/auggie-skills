@@ -51,10 +51,23 @@ CONTENT_SUBPATH = Path("src/content/wikis")
 CLONE_TIMEOUT = 300
 PUSH_TIMEOUT = 300
 PUSH_RETRIES = 3
+NPM_INSTALL_TIMEOUT = 600
+BUILD_TIMEOUT = 600
+# How many trailing lines of build output to surface in the PublishError so
+# the user can see what went wrong without drowning in npm noise.
+BUILD_OUTPUT_TAIL_LINES = 80
 
 
 class PublishError(RuntimeError):
     """Raised when the publish pipeline cannot continue."""
+
+
+class BuildToolingMissing(RuntimeError):
+    """Raised when ``npm`` / ``node`` aren't on PATH so we cannot run
+    ``astro build``.  ``publish()`` catches this to skip the build
+    validation step (and the push) with an actionable summary instead
+    of aborting with a hard error.
+    """
 
 
 @dataclass
@@ -65,6 +78,12 @@ class PublishResult:
     entry_path: Path
     commit_sha: str | None
     pushed: bool
+    # Set when ``validate_astro_build`` could not run (e.g. ``npm`` missing
+    # in the publish environment).  When ``True`` the entry was written
+    # locally but the host repo was *not* committed/pushed; the operator
+    # has to run ``npm install && npm run build`` manually before pushing.
+    validation_skipped: bool = False
+    validation_skipped_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -349,8 +368,15 @@ def _refresh_existing_clone(
         base + ["reset", "--hard", f"origin/{branch}"],
         cwd=work_dir, capture=True, timeout=CLONE_TIMEOUT,
     )
+    # ``-fd`` (without ``x``) deliberately preserves gitignored
+    # paths.  In practice that means ``node_modules/`` and ``dist/``
+    # survive across re-runs of ``--wiki-work-dir``, so the
+    # ``validate_astro_build`` step can skip ``npm install`` and reuse
+    # cached deps.  Tracked files are still reset to ``origin/<branch>``
+    # by the preceding ``reset --hard`` so the working tree stays
+    # pristine.
     _run(
-        base + ["clean", "-fdx"],
+        base + ["clean", "-fd"],
         cwd=work_dir, capture=True, timeout=CLONE_TIMEOUT,
     )
 
@@ -450,6 +476,116 @@ def write_entry(
         encoding="utf-8",
     )
     return entry
+
+
+# ---------------------------------------------------------------------------
+# astro build validation
+# ---------------------------------------------------------------------------
+def _check_build_toolchain() -> str | None:
+    """Return ``None`` when ``npm`` and ``node`` are both on PATH.
+
+    Otherwise return a human-readable reason that the caller surfaces in
+    a skip-with-summary message.  We deliberately do not check versions:
+    the host repo's ``package.json`` is what dictates compatibility, and
+    asking the operator to upgrade is more useful than asking us to.
+    """
+    missing: list[str] = []
+    for tool in ("node", "npm"):
+        if shutil.which(tool) is None:
+            missing.append(tool)
+    if missing:
+        return (
+            f"required build tooling not found on PATH: {', '.join(missing)} "
+            "(install Node.js, then re-run, or pass --skip-build-validation "
+            "to bypass and push without local validation)"
+        )
+    return None
+
+
+def _tail_output(text: str, *, limit: int = BUILD_OUTPUT_TAIL_LINES) -> str:
+    """Return at most ``limit`` trailing lines of ``text`` for error reports."""
+    lines = text.splitlines()
+    if len(lines) <= limit:
+        return text.rstrip()
+    return "...\n" + "\n".join(lines[-limit:]).rstrip()
+
+
+def _npm_install(work_dir: Path, *, timeout: int = NPM_INSTALL_TIMEOUT) -> None:
+    """Populate ``node_modules`` if it is missing.
+
+    No-op when ``node_modules`` already exists so persistent ``--work-dir``
+    runs don't pay the install cost on every publish.  We avoid ``npm ci``
+    because the host repo template ships without a lock file; ``npm
+    install`` is the lowest-friction option.
+    """
+    if (work_dir / "node_modules").is_dir():
+        log.info("node_modules already present in %s; skipping npm install", work_dir)
+        return
+    log.info("Installing host-repo dependencies (npm install) in %s", work_dir)
+    proc = _run(
+        ["npm", "install", "--no-audit", "--no-fund", "--loglevel=error"],
+        cwd=work_dir,
+        capture=True,
+        check=False,
+        timeout=timeout,
+    )
+    if proc.returncode != 0:
+        raise PublishError(
+            "npm install failed in the host repo clone "
+            f"({work_dir}); cannot validate astro build:\n"
+            f"{_tail_output(_redact((proc.stderr or '') + (proc.stdout or '')))}"
+        )
+
+
+def validate_astro_build(
+    work_dir: Path,
+    *,
+    install_timeout: int = NPM_INSTALL_TIMEOUT,
+    build_timeout: int = BUILD_TIMEOUT,
+) -> None:
+    """Run ``astro build`` in ``work_dir`` to catch invalid MDX/YAML.
+
+    The Astro static-site host repo is auto-deployed on push, so a broken
+    ``index.mdx`` (e.g. malformed YAML frontmatter, unclosed Mermaid
+    block) only surfaces as a Vercel/Netlify deploy failure long after
+    the bad commit has already landed.  Running the build locally before
+    pushing keeps the host repo green.
+
+    Raises:
+        BuildToolingMissing: when ``npm``/``node`` aren't on PATH; the
+            caller is expected to skip the publish with a summary.
+        PublishError: when the build itself fails (including ``npm
+            install`` errors).  Push must be skipped in that case.
+    """
+    reason = _check_build_toolchain()
+    if reason is not None:
+        raise BuildToolingMissing(reason)
+    if not (work_dir / "package.json").is_file():
+        # The host repo *should* always have a package.json next to the
+        # ``src/content/wikis/`` collection; if it doesn't, the project
+        # isn't an Astro site and we have nothing to validate.
+        raise PublishError(
+            f"Host repo at {work_dir} has no package.json; "
+            "cannot run astro build to validate the new entry."
+        )
+    _npm_install(work_dir, timeout=install_timeout)
+    log.info("Validating with `npm run build` (astro build) in %s", work_dir)
+    proc = _run(
+        ["npm", "run", "build", "--silent"],
+        cwd=work_dir,
+        capture=True,
+        check=False,
+        timeout=build_timeout,
+    )
+    if proc.returncode != 0:
+        combined = _redact((proc.stderr or "") + (proc.stdout or ""))
+        raise PublishError(
+            "astro build failed against the new entry; refusing to push. "
+            "Inspect the entry, fix the source, and re-run.\n"
+            f"--- last {BUILD_OUTPUT_TAIL_LINES} lines of build output ---\n"
+            f"{_tail_output(combined)}"
+        )
+    log.info("astro build OK")
 
 
 def _has_staged_changes(work_dir: Path) -> bool:
@@ -566,8 +702,17 @@ def publish(
     keep_work_dir: bool = False,
     author_name: str = "auggie-deep-wiki",
     author_email: str = "auggie-deep-wiki@users.noreply.github.com",
+    skip_build_validation: bool = False,
 ) -> PublishResult:
-    """Publish ``<output_dir>/wiki.mdx`` to the host Astro repository."""
+    """Publish ``<output_dir>/wiki.mdx`` to the host Astro repository.
+
+    Before pushing, runs ``astro build`` against the cloned host repo so
+    that malformed MDX/YAML never lands on the deployed site.  When
+    ``npm``/``node`` aren't available the validation step is skipped and
+    the publish is aborted with a summary so the operator can re-run
+    elsewhere; pass ``skip_build_validation=True`` to bypass entirely
+    (e.g. CI environments that explicitly trust the input).
+    """
     check_git()
 
     repo_url = (wiki_repo or os.environ.get(WIKI_REPO_ENV) or "").strip()
@@ -620,6 +765,47 @@ def publish(
             metadata=metadata,
             structure=structure or None,
         )
+
+        # Validate before any commit/push so a broken MDX/YAML entry
+        # never reaches the host repo.  Three outcomes:
+        #   1. validation passes -> commit + push as usual.
+        #   2. tooling missing   -> skip both validation and push, keep
+        #      the work dir, and surface a manual-recovery summary.
+        #   3. build fails       -> propagate PublishError; no push.
+        validation_skipped = False
+        validation_skipped_reason: str | None = None
+        if skip_build_validation:
+            validation_skipped = True
+            validation_skipped_reason = "explicitly bypassed (--skip-build-validation)"
+            log.warning(
+                "Build validation bypassed; pushing without local astro build"
+            )
+        else:
+            try:
+                validate_astro_build(target)
+            except BuildToolingMissing as exc:
+                validation_skipped = True
+                validation_skipped_reason = str(exc)
+                log.warning(
+                    "Build validation skipped: %s. Refusing to push so the "
+                    "host repo stays green; entry left at %s for manual "
+                    "review.",
+                    exc,
+                    entry,
+                )
+                # Do not push; preserve the work dir for manual inspection.
+                cleanup_dir = None
+                return PublishResult(
+                    repo_url=repo_url,
+                    branch=branch,
+                    slug=final_slug,
+                    entry_path=entry.resolve().relative_to(target.resolve()),
+                    commit_sha=None,
+                    pushed=False,
+                    validation_skipped=validation_skipped,
+                    validation_skipped_reason=validation_skipped_reason,
+                )
+
         sha, pushed = commit_and_push(
             target,
             slug=final_slug,
@@ -641,6 +827,8 @@ def publish(
             entry_path=entry.resolve().relative_to(target.resolve()),
             commit_sha=sha,
             pushed=pushed,
+            validation_skipped=validation_skipped,
+            validation_skipped_reason=validation_skipped_reason,
         )
     finally:
         if cleanup_dir is not None:
@@ -693,6 +881,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="auggie-deep-wiki@users.noreply.github.com",
         help="git author/committer email",
     )
+    p.add_argument(
+        "--skip-build-validation",
+        action="store_true",
+        help=(
+            "Skip the local `astro build` step that catches malformed "
+            "MDX/YAML before pushing. Use only when the host repo has "
+            "out-of-band validation in CI."
+        ),
+    )
     p.add_argument("--verbose", "-v", action="store_true")
     return p
 
@@ -714,10 +911,22 @@ def main(argv: list[str] | None = None) -> int:
             keep_work_dir=args.keep_work_dir,
             author_name=args.author_name,
             author_email=args.author_email,
+            skip_build_validation=args.skip_build_validation,
         )
     except PublishError as exc:
         log.error("Publish failed: %s", exc)
         return 1
+    if result.validation_skipped and not result.pushed:
+        log.error(
+            "Build validation skipped (%s) and push aborted. The new "
+            "entry is at %s; install Node.js, then run "
+            "`cd <work-dir> && npm install && npm run build && git push` "
+            "to publish manually, or pass --skip-build-validation to "
+            "bypass on the next run.",
+            result.validation_skipped_reason,
+            result.entry_path,
+        )
+        return 3
     log.info(
         "✓ slug=%s entry=%s commit=%s pushed=%s",
         result.slug,
