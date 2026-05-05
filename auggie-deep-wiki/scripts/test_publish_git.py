@@ -630,6 +630,111 @@ class TestDeriveSlugFallback:
 # ---------------------------------------------------------------------------
 # commit_and_push — push-rejection retry only fires on non-fast-forward
 # ---------------------------------------------------------------------------
+class TestCommitAndPushScoping:
+    """``commit_and_push`` must only stage the slug directory, never
+    tooling artifacts that ``validate_astro_build`` may have left in
+    the work dir (most notably ``package-lock.json`` from ``npm install``
+    on the bare host-repo template).
+    """
+
+    @staticmethod
+    def _git(*args: str, cwd: Path) -> None:
+        env = os.environ.copy()
+        env.update(
+            {
+                "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e",
+            }
+        )
+        subprocess.run(
+            ["git", *args], cwd=cwd, env=env, check=True, capture_output=True,
+        )
+
+    def _init_host_repo(self, tmp_path: Path) -> Path:
+        """Init a real on-disk git repo with the host-repo layout."""
+        work_dir = tmp_path / "host"
+        work_dir.mkdir()
+        self._git("init", "--initial-branch=main", cwd=work_dir)
+        self._git("config", "commit.gpgsign", "false", cwd=work_dir)
+        # seed with an empty initial commit so HEAD exists
+        self._git("commit", "--allow-empty", "-m", "init", cwd=work_dir)
+        (work_dir / "src" / "content" / "wikis").mkdir(parents=True)
+        return work_dir
+
+    def test_only_slug_dir_is_staged(self, tmp_path):
+        """A stray ``package-lock.json`` from ``npm install`` must NOT
+        end up in the publish commit.
+        """
+        work_dir = self._init_host_repo(tmp_path)
+        # write the wiki entry inside the content collection
+        slug_dir = work_dir / "src" / "content" / "wikis" / "abc"
+        slug_dir.mkdir(parents=True)
+        (slug_dir / "index.mdx").write_text("---\ntitle: x\n---\n")
+        # simulate the validation side effects: a tooling artifact at
+        # the repo root that git would otherwise pick up via ``-A``
+        (work_dir / "package-lock.json").write_text('{"lockfileVersion": 3}')
+        (work_dir / "package.json").write_text('{"name": "site"}')
+
+        sha, pushed = pg.commit_and_push(
+            work_dir,
+            slug="abc", branch="main", push=False, token=None,
+            author_name="t", author_email="t@e",
+        )
+        assert sha is not None
+        assert pushed is False
+        # Inspect what was actually committed
+        proc = subprocess.run(
+            ["git", "show", "--name-only", "--pretty=", "HEAD"],
+            cwd=work_dir, check=True, capture_output=True, text=True,
+        )
+        committed = {ln.strip() for ln in proc.stdout.splitlines() if ln.strip()}
+        assert committed == {"src/content/wikis/abc/index.mdx"}
+        assert "package-lock.json" not in committed
+        assert "package.json" not in committed
+        # And the stray files remain untracked in the working tree
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=work_dir, check=True, capture_output=True, text=True,
+        )
+        # Both untracked artifacts should still appear as ``??`` entries
+        statuses = [ln for ln in proc.stdout.splitlines() if ln]
+        assert any("package-lock.json" in ln for ln in statuses)
+        assert any("package.json" in ln for ln in statuses)
+
+    def test_no_changes_in_slug_dir_skips_commit(self, tmp_path):
+        """Even with stray tooling artifacts present, if the slug
+        itself didn't change, no commit must be created.
+        """
+        work_dir = self._init_host_repo(tmp_path)
+        # commit an existing wiki entry first
+        slug_dir = work_dir / "src" / "content" / "wikis" / "abc"
+        slug_dir.mkdir(parents=True)
+        (slug_dir / "index.mdx").write_text("---\ntitle: x\n---\n")
+        self._git("add", "src/content/wikis/abc", cwd=work_dir)
+        self._git("commit", "-m", "seed", cwd=work_dir)
+        head_before = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=work_dir, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        # Now drop a stray lockfile (npm install side effect) but
+        # leave the slug content untouched.
+        (work_dir / "package-lock.json").write_text('{"lockfileVersion": 3}')
+
+        sha, pushed = pg.commit_and_push(
+            work_dir,
+            slug="abc", branch="main", push=False, token=None,
+            author_name="t", author_email="t@e",
+        )
+        assert sha is None
+        assert pushed is False
+        head_after = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=work_dir, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        # No new commit was created.
+        assert head_before == head_after
+
+
 class TestPushRetryClassification:
     """The retry loop must only rebase-and-retry on the canonical
     non-fast-forward signals; protected-branch / hook rejections must

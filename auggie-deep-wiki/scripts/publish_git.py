@@ -624,7 +624,15 @@ def commit_and_push(
             "GIT_COMMITTER_EMAIL": author_email,
         }
     )
-    _run(["git", "add", "-A"], cwd=work_dir, env=env, capture=True)
+    # Scope staging to the slug directory only.  ``validate_astro_build``
+    # runs ``npm install`` inside the clone, which can create
+    # ``package-lock.json`` (the host repo template ships without one)
+    # and other tooling artifacts; a bare ``git add -A`` would silently
+    # commit those alongside the wiki entry.  Restricting the pathspec
+    # keeps the publish commit focused on what the user actually
+    # intended to publish.
+    slug_path = f"{CONTENT_SUBPATH.as_posix()}/{_sanitize_slug(slug)}"
+    _run(["git", "add", "--", slug_path], cwd=work_dir, env=env, capture=True)
     if not _has_staged_changes(work_dir):
         log.info("No changes for slug %s; skipping commit", slug)
         return None, False
