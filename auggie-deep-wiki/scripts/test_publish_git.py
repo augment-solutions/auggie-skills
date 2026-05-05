@@ -374,6 +374,41 @@ class TestRedact:
         assert "ghp_topsecret" not in rendered
         assert "Bearer ***" in rendered
 
+    # The npm-install failure tail can include ``.npmrc``-style auth
+    # credentials when a transitive dep names a private registry.
+    # ``_redact`` must mask each documented form before the tail lands
+    # in a ``PublishError`` (and thus in CI logs).
+    @pytest.mark.parametrize(
+        "raw, secret",
+        [
+            ("//registry.npmjs.org/:_authToken=npm_abc123def", "npm_abc123def"),
+            ("_authToken=ghp_supersecret", "ghp_supersecret"),
+            ("//registry.example.com/:_auth=dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("_password=base64encodedpw", "base64encodedpw"),
+            ("Authorization: Bearer xoxb-slack-token-9999", "xoxb-slack-token-9999"),
+        ],
+    )
+    def test_masks_npm_credentials(self, raw, secret):
+        redacted = pg._redact(raw)
+        assert secret not in redacted
+        assert "***" in redacted
+
+    def test_masks_inside_multiline_build_output(self):
+        # Mirror what an npm-install failure tail actually looks like.
+        log_block = (
+            "npm error code E401\n"
+            "npm error 401 Unauthorized - GET https://registry.example.com/foo\n"
+            "npm error 401 In most cases you or one of your dependencies are\n"
+            "//registry.example.com/:_authToken=ghs_topsecret_token_xyz\n"
+            "//registry.example.com/:_password=YmFzZTY0cHc=\n"
+            "Authorization: Bearer ghp_alsosecret\n"
+        )
+        redacted = pg._redact(log_block)
+        for needle in (
+            "ghs_topsecret_token_xyz", "YmFzZTY0cHc=", "ghp_alsosecret"
+        ):
+            assert needle not in redacted
+
 
 class TestRunHelper:
     def test_timeout_becomes_publish_error(self):
@@ -866,6 +901,11 @@ class TestValidateAstroBuild:
         monkeypatch.setattr(pg.shutil, "which", lambda _: "/usr/local/bin/" + _)
         target = self._seed_host_repo(tmp_path)
         (target / "node_modules").mkdir()
+        # Seed the sentinel that records the manifest hash from the last
+        # successful install so freshness check returns ``True``.
+        (target / "node_modules" / pg._PKG_HASH_SENTINEL).write_text(
+            pg._pkg_manifest_hash(target)
+        )
         calls: list[list[str]] = []
 
         def fake_run(cmd, **kw):
@@ -879,18 +919,56 @@ class TestValidateAstroBuild:
         assert all(c[:2] != ["npm", "install"] for c in calls)
         assert any(c[:3] == ["npm", "run", "build"] for c in calls)
 
+    def test_pkg_manifest_drift_forces_reinstall(self, tmp_path, monkeypatch):
+        """When ``package.json`` changes between runs, the cached
+        ``node_modules`` must be discarded and reinstalled."""
+        monkeypatch.setattr(pg.shutil, "which", lambda _: "/usr/local/bin/" + _)
+        target = self._seed_host_repo(tmp_path)
+        node_modules = target / "node_modules"
+        node_modules.mkdir()
+        # Pretend a previous run installed against a different manifest.
+        (node_modules / pg._PKG_HASH_SENTINEL).write_text("stale-hash")
+        # Drop a fake nested file so we can verify the rmtree happened.
+        (node_modules / "leftover.txt").write_text("from previous run")
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            # Simulate npm install actually creating node_modules anew.
+            if cmd[:2] == ["npm", "install"]:
+                node_modules.mkdir(exist_ok=True)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(pg, "_run", fake_run)
+        pg.validate_astro_build(target)
+
+        # npm install ran (drift forced reinstall) before the build.
+        assert calls[0][:2] == ["npm", "install"]
+        # The leftover from the prior run was removed.
+        assert not (node_modules / "leftover.txt").exists()
+        # New sentinel matches the current manifest.
+        assert (node_modules / pg._PKG_HASH_SENTINEL).read_text() == pg._pkg_manifest_hash(target)
+
     def test_npm_install_failure_becomes_publish_error(self, tmp_path, monkeypatch):
         monkeypatch.setattr(pg.shutil, "which", lambda _: "/usr/local/bin/" + _)
         target = self._seed_host_repo(tmp_path)
 
         def fake_run(cmd, **kw):
             if cmd[:2] == ["npm", "install"]:
+                # Simulate a partial install: node_modules exists but
+                # nothing inside it is usable.
+                (target / "node_modules").mkdir(exist_ok=True)
+                (target / "node_modules" / "half-installed.txt").write_text("oops")
                 return subprocess.CompletedProcess(cmd, 1, "", "EACCES denied")
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         monkeypatch.setattr(pg, "_run", fake_run)
         with pytest.raises(pg.PublishError, match="npm install failed"):
             pg.validate_astro_build(target)
+        # Failure cleanup: the partial node_modules tree is removed so
+        # the next run starts clean instead of silently reusing it.
+        assert not (target / "node_modules").exists()
 
     def test_build_failure_becomes_publish_error_with_tail(self, tmp_path, monkeypatch):
         monkeypatch.setattr(pg.shutil, "which", lambda _: "/usr/local/bin/" + _)
@@ -1038,3 +1116,96 @@ class TestPublishBuildValidationIntegration:
         assert result.pushed is True
         assert result.validation_skipped is False
         assert result.validation_skipped_reason is None
+
+    def test_no_push_dry_run_skips_validation(self, tmp_path, monkeypatch):
+        """``--no-push`` is a dry run; paying the install/build cost is
+        wasteful and inconsistent with the operator's intent.  The
+        publisher should commit locally only and report the skip.
+        """
+        out = self._make_output(tmp_path)
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        self._seed_clone(monkeypatch)
+
+        validate_called = {"count": 0}
+
+        def fake_validate(*a, **kw):
+            validate_called["count"] += 1
+
+        monkeypatch.setattr(pg, "validate_astro_build", fake_validate)
+        monkeypatch.setattr(pg, "commit_and_push", lambda *a, **kw: ("abc", False))
+
+        result = pg.publish(
+            output_dir=out, work_dir=tmp_path / "clone", push=False,
+        )
+        # Validation never runs; the dry-run commit still happens.
+        assert validate_called["count"] == 0
+        assert result.pushed is False
+        assert result.validation_skipped is True
+        assert "dry run" in (result.validation_skipped_reason or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# CLI exit codes
+# ---------------------------------------------------------------------------
+class TestCliExitCodes:
+    """The ``main()`` exit code is part of the CLI contract; CI uses
+    it to distinguish failure modes from intentional skip states."""
+
+    def _setup(self, tmp_path, monkeypatch):
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "wiki.mdx").write_text("---\n# T\n---\n")
+        (out / "repo_metadata.json").write_text('{"owner": "o", "name": "n"}')
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        return out
+
+    def test_no_push_returns_zero_even_with_validation_skipped(
+        self, tmp_path, monkeypatch
+    ):
+        """``--no-push`` flips ``validation_skipped`` to True (dry-run
+        skip), but that is a successful run from the user's POV → 0.
+        """
+        out = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            pg, "publish",
+            lambda **_: pg.PublishResult(
+                repo_url="https://github.com/x/y.git", branch="main",
+                slug="o-n", entry_path=Path("src/content/wikis/o-n/index.mdx"),
+                commit_sha="abc", pushed=False,
+                validation_skipped=True,
+                validation_skipped_reason="dry run (--no-push); validation skipped",
+            ),
+        )
+        rc = pg.main([
+            "--output-dir", str(out), "--no-push",
+        ])
+        assert rc == 0
+
+    def test_tooling_missing_returns_three(self, tmp_path, monkeypatch):
+        """When push was *requested* but tooling was missing the CLI
+        returns 3 so callers can distinguish "fix your env" from
+        either success (0) or a hard failure (1).
+        """
+        out = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            pg, "publish",
+            lambda **_: pg.PublishResult(
+                repo_url="https://github.com/x/y.git", branch="main",
+                slug="o-n", entry_path=Path("src/content/wikis/o-n/index.mdx"),
+                commit_sha=None, pushed=False,
+                validation_skipped=True,
+                validation_skipped_reason="required build tooling not found on PATH: node, npm",
+            ),
+        )
+        rc = pg.main(["--output-dir", str(out)])
+        assert rc == 3
+
+    def test_publish_error_returns_one(self, tmp_path, monkeypatch):
+        out = self._setup(tmp_path, monkeypatch)
+
+        def boom(**_):
+            raise pg.PublishError("clone failed")
+
+        monkeypatch.setattr(pg, "publish", boom)
+        rc = pg.main(["--output-dir", str(out)])
+        assert rc == 1

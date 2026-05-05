@@ -554,7 +554,7 @@ def build_static_optional(output_dir: Path) -> None:
         log.warning("Static viewer emission failed: %s", exc)
 
 
-def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> None:
+def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> bool:
     """Optional Git-backed Astro publish step.
 
     Only runs when ``--publish-git`` is set. Clones a host Astro
@@ -562,9 +562,13 @@ def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> None:
     behaviour (local filesystem output) is unchanged when this flag is
     omitted, so this step is purely additive and any failure here
     leaves the local ``wiki.mdx``/``index.html`` deliverables intact.
+
+    Returns ``True`` when the publish completed (or was a successful
+    dry run), ``False`` when build validation was skipped due to
+    missing tooling so the orchestrator can propagate exit code 3.
     """
     if not args.publish_git:
-        return
+        return True
     publisher = Path(__file__).parent / "publish_git.py"
     if not publisher.exists():
         raise RuntimeError(
@@ -590,7 +594,13 @@ def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> None:
         keep_work_dir=args.keep_wiki_work_dir,
         skip_build_validation=args.skip_build_validation,
     )
-    if result.validation_skipped and not result.pushed:
+    # ``--no-push`` is an intentional dry run; the publisher reports
+    # ``validation_skipped`` for it too, so distinguish before treating
+    # it as a degraded outcome.
+    tooling_skip = (
+        result.validation_skipped and not result.pushed and not args.no_push
+    )
+    if tooling_skip:
         log.warning(
             "Published %s locally to %s but DID NOT push: build "
             "validation %s. Install Node.js + run `npm install && "
@@ -600,7 +610,7 @@ def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> None:
             result.entry_path,
             result.validation_skipped_reason,
         )
-        return
+        return False
     log.info(
         "Published %s -> %s (commit=%s pushed=%s)",
         result.slug,
@@ -608,12 +618,13 @@ def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> None:
         result.commit_sha or "<no-change>",
         result.pushed,
     )
+    return True
 
 
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
-def generate_wiki(args: argparse.Namespace) -> Path:
+def generate_wiki(args: argparse.Namespace) -> tuple[Path, bool]:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     prompts_dir = Path(__file__).parent.parent / "prompts"
@@ -670,11 +681,11 @@ def generate_wiki(args: argparse.Namespace) -> Path:
         if not args.no_static:
             build_static_optional(output_dir)
 
-        publish_git_optional(args, output_dir)
+        publish_ok = publish_git_optional(args, output_dir)
 
         elapsed = time.monotonic() - started
         log.info("✓ Wiki generated in %.1fs -> %s", elapsed, wiki_path)
-        return wiki_path
+        return wiki_path, publish_ok
     finally:
         if cleanup_workspace:
             log.info("Cleaning up workspace %s", workspace_dir)
@@ -845,7 +856,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        generate_wiki(args)
+        _, publish_ok = generate_wiki(args)
     except KeyboardInterrupt:
         log.error("Interrupted")
         return 130
@@ -854,6 +865,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.verbose:
             raise
         return 1
+    # Exit code 3 mirrors publish_git's: the wiki was generated locally
+    # but the host repo could not be updated because build-validation
+    # tooling (node/npm) was missing.  Distinguishes "fix your env" from
+    # "everything succeeded" (0) or "hard failure" (1).
+    if not publish_ok:
+        return 3
     return 0
 
 

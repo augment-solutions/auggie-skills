@@ -139,14 +139,17 @@ What happens, in order:
    language, topics) and written to
    `src/content/wikis/<slug>/index.mdx`. Any existing directory for
    the same slug is replaced atomically; other wikis are untouched.
-4. `npm install` (only when `node_modules/` is missing) followed by
-   `npm run build` (i.e. `astro build`) is run inside the clone. Any
-   build error — bad YAML frontmatter, unclosed Mermaid block,
-   broken JSX — aborts the publish before commit/push so the host
-   repo stays green. The clone is preserved on failure for
-   inspection. If `node`/`npm` aren't available, this step is
-   skipped and the publish bails out with a manual-recovery summary
-   (no commit, no push); pass `--skip-build-validation` to bypass.
+4. `npm install` (only when `node_modules/` is missing **or** the
+   host repo's `package.json`/`package-lock.json` changed since the
+   last run) followed by `npm run build` (i.e. `astro build`) is run
+   inside the clone. Any build error — bad YAML frontmatter,
+   unclosed Mermaid block, broken JSX — aborts the publish before
+   commit/push so the host repo stays green. The clone is preserved
+   on failure for inspection. If `node`/`npm` aren't available, this
+   step is skipped and the publish bails out with a manual-recovery
+   summary (no commit, no push); pass `--skip-build-validation` to
+   bypass. `--no-push` (dry run) skips this step automatically since
+   nothing is being pushed.
 5. `git add` / `git commit -m "deep-wiki: update <slug>"`. If the
    index is empty (idempotent re-run), the commit is skipped.
 6. `git push origin <branch>`. On a non-fast-forward rejection (a
@@ -158,6 +161,20 @@ What happens, in order:
 Multi-wiki layout: every wiki is one entry in the `wikis` content
 collection, so a single host repo hosts all of them. The landing page
 (`/`) lists everything; each wiki lives at `/wikis/<slug>/`.
+
+### Exit codes
+
+`generate_wiki.py` and `publish_git.py` share the following exit codes
+so CI can branch on them:
+
+- `0`: success (or successful `--no-push` dry run).
+- `1`: hard failure (clone error, build failure, push rejected, etc.).
+- `2`: prerequisites missing (`auggie`/`git` not on PATH).
+- `3`: wiki generated locally, but the host repo was **not** updated
+  because build-validation tooling (`node`/`npm`) was missing.
+  Install Node.js and re-run, or pass `--skip-build-validation` to
+  bypass.
+- `130`: interrupted (Ctrl-C).
 
 ## Output layout
 

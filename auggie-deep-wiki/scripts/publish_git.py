@@ -31,6 +31,7 @@ host) that auto-deploys on push.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -93,12 +94,43 @@ _AUTH_HEADER_RE = re.compile(
     r"(http\.extraHeader=Authorization:\s*Bearer\s+)\S+", re.IGNORECASE
 )
 _URL_USERINFO_RE = re.compile(r"(https?://)[^/@\s]+@")
+# npm-specific credential patterns that can appear in build/install output
+# when the host repo (or a transitive dep) ships a ``.npmrc`` that names
+# a private registry.  ``npm install`` echoes the offending line on auth
+# failures, so the token leaks into the build-output tail we surface in
+# ``PublishError``.  Cover the common forms documented at
+# https://docs.npmjs.com/cli/v10/configuring-npm/npmrc:
+#   //registry.example.com/:_authToken=<token>
+#   //registry.example.com/:_auth=<base64>
+#   //registry.example.com/:_password=<base64>
+#   _authToken=<token>  (top-level form)
+#   _auth=<base64>
+#   _password=<base64>
+_NPM_TOKEN_RE = re.compile(
+    r"(_authToken|_auth|_password)\s*=\s*\S+", re.IGNORECASE
+)
+# ``Authorization: Bearer <tok>`` outside the git config form (e.g. in
+# raw HTTP error tails npm prints when a registry rejects auth).
+_BEARER_RE = re.compile(
+    r"(Authorization:\s*Bearer\s+)\S+", re.IGNORECASE
+)
 
 
 def _redact(text: str) -> str:
-    """Strip credentials from a string before it lands in logs or errors."""
+    """Strip credentials from a string before it lands in logs or errors.
+
+    Covers:
+    - Git ``http.extraHeader=Authorization: Bearer ...`` (our own injection).
+    - Generic ``Authorization: Bearer ...`` headers in HTTP error tails.
+    - URL userinfo (``https://user:pass@host``).
+    - npm ``.npmrc``-style credentials (``_authToken`` / ``_auth`` /
+      ``_password``) which may surface in ``npm install`` failure output
+      that ``validate_astro_build`` tails into ``PublishError``.
+    """
     text = _AUTH_HEADER_RE.sub(r"\1***", text)
+    text = _BEARER_RE.sub(r"\1***", text)
     text = _URL_USERINFO_RE.sub(r"\1***@", text)
+    text = _NPM_TOKEN_RE.sub(r"\1=***", text)
     return text
 
 
@@ -510,17 +542,73 @@ def _tail_output(text: str, *, limit: int = BUILD_OUTPUT_TAIL_LINES) -> str:
     return "...\n" + "\n".join(lines[-limit:]).rstrip()
 
 
-def _npm_install(work_dir: Path, *, timeout: int = NPM_INSTALL_TIMEOUT) -> None:
-    """Populate ``node_modules`` if it is missing.
+# File written next to ``node_modules/`` recording the manifest hash that
+# was installed.  Used to detect ``package.json`` / ``package-lock.json``
+# drift across re-runs of a persistent ``--wiki-work-dir``: if the host
+# repo bumped a dep since the last run, we wipe ``node_modules/`` and
+# reinstall instead of silently building against a stale dep tree.
+_PKG_HASH_SENTINEL = ".deep-wiki-pkg-hash"
 
-    No-op when ``node_modules`` already exists so persistent ``--work-dir``
-    runs don't pay the install cost on every publish.  We avoid ``npm ci``
-    because the host repo template ships without a lock file; ``npm
-    install`` is the lowest-friction option.
+
+def _pkg_manifest_hash(work_dir: Path) -> str:
+    """Stable digest of the install inputs (``package.json`` +
+    ``package-lock.json`` if present).  Used to detect manifest drift."""
+    h = hashlib.sha256()
+    for name in ("package.json", "package-lock.json"):
+        f = work_dir / name
+        if f.is_file():
+            h.update(name.encode("utf-8"))
+            h.update(b"\0")
+            h.update(f.read_bytes())
+            h.update(b"\0")
+    return h.hexdigest()
+
+
+def _node_modules_is_fresh(work_dir: Path, current_hash: str) -> bool:
+    """``True`` when the existing ``node_modules/`` was installed against
+    the same manifest we're about to validate against."""
+    sentinel = work_dir / "node_modules" / _PKG_HASH_SENTINEL
+    if not sentinel.is_file():
+        return False
+    try:
+        return sentinel.read_text(encoding="utf-8").strip() == current_hash
+    except OSError:
+        return False
+
+
+def _npm_install(work_dir: Path, *, timeout: int = NPM_INSTALL_TIMEOUT) -> None:
+    """Populate ``node_modules`` if it is missing or stale.
+
+    No-op when ``node_modules`` exists *and* was installed against the
+    same ``package.json`` / ``package-lock.json`` we see now (sentinel
+    file ``.deep-wiki-pkg-hash`` inside ``node_modules``).  When the host
+    repo bumps a dep between re-runs of a persistent ``--wiki-work-dir``,
+    we wipe and reinstall so the local validation matches what Vercel
+    would do with a cold cache.
+
+    On install failure, ``node_modules/`` is removed so the next attempt
+    starts from a clean slate (a partial install would otherwise pass
+    the freshness check and silently propagate the broken state).
+
+    We avoid ``npm ci`` because the host repo template ships without a
+    lock file; ``npm install`` is the lowest-friction option.
     """
-    if (work_dir / "node_modules").is_dir():
-        log.info("node_modules already present in %s; skipping npm install", work_dir)
-        return
+    current_hash = _pkg_manifest_hash(work_dir)
+    node_modules = work_dir / "node_modules"
+    if node_modules.is_dir():
+        if _node_modules_is_fresh(work_dir, current_hash):
+            log.info(
+                "node_modules already present in %s and manifest unchanged; "
+                "skipping npm install",
+                work_dir,
+            )
+            return
+        log.info(
+            "node_modules in %s was installed against a different "
+            "package.json/lock; wiping and reinstalling",
+            work_dir,
+        )
+        shutil.rmtree(node_modules, ignore_errors=True)
     log.info("Installing host-repo dependencies (npm install) in %s", work_dir)
     proc = _run(
         ["npm", "install", "--no-audit", "--no-fund", "--loglevel=error"],
@@ -530,11 +618,24 @@ def _npm_install(work_dir: Path, *, timeout: int = NPM_INSTALL_TIMEOUT) -> None:
         timeout=timeout,
     )
     if proc.returncode != 0:
+        # Clean up the partial tree so the next run can recover instead
+        # of being silently fooled by ``_node_modules_is_fresh`` returning
+        # ``False`` (no sentinel) but a half-populated ``node_modules/``
+        # still being on disk and confusing downstream tooling.
+        if node_modules.is_dir():
+            shutil.rmtree(node_modules, ignore_errors=True)
         raise PublishError(
             "npm install failed in the host repo clone "
             f"({work_dir}); cannot validate astro build:\n"
             f"{_tail_output(_redact((proc.stderr or '') + (proc.stdout or '')))}"
         )
+    # Record the manifest hash *only* on success so a partial install
+    # cannot be mistaken for a complete one on the next run.
+    try:
+        (node_modules / _PKG_HASH_SENTINEL).write_text(current_hash, encoding="utf-8")
+    except OSError as exc:
+        # Non-fatal: worst case we re-install on the next run.
+        log.warning("Failed to write %s sentinel in %s: %s", _PKG_HASH_SENTINEL, node_modules, exc)
 
 
 def validate_astro_build(
@@ -570,8 +671,12 @@ def validate_astro_build(
         )
     _npm_install(work_dir, timeout=install_timeout)
     log.info("Validating with `npm run build` (astro build) in %s", work_dir)
+    # Run without ``--silent`` so warnings (deprecation notices, content
+    # collection diagnostics, slow-build hints) reach the captured tail.
+    # We already truncate to ``BUILD_OUTPUT_TAIL_LINES`` and redact
+    # credentials before surfacing it, so the noise stays bounded.
     proc = _run(
-        ["npm", "run", "build", "--silent"],
+        ["npm", "run", "build"],
         cwd=work_dir,
         capture=True,
         check=False,
@@ -775,11 +880,15 @@ def publish(
         )
 
         # Validate before any commit/push so a broken MDX/YAML entry
-        # never reaches the host repo.  Three outcomes:
+        # never reaches the host repo.  Four outcomes:
         #   1. validation passes -> commit + push as usual.
         #   2. tooling missing   -> skip both validation and push, keep
         #      the work dir, and surface a manual-recovery summary.
         #   3. build fails       -> propagate PublishError; no push.
+        #   4. ``push=False``    -> dry run; skip validation entirely
+        #      since the operator can inspect the work dir and run
+        #      ``npm run build`` manually if they want.  Paying the
+        #      install/build cost on every dry run would be wasteful.
         validation_skipped = False
         validation_skipped_reason: str | None = None
         if skip_build_validation:
@@ -787,6 +896,17 @@ def publish(
             validation_skipped_reason = "explicitly bypassed (--skip-build-validation)"
             log.warning(
                 "Build validation bypassed; pushing without local astro build"
+            )
+        elif not push:
+            validation_skipped = True
+            validation_skipped_reason = (
+                "dry run (--no-push); validation skipped to keep the dry "
+                "run cheap. Run `npm install && npm run build` in the "
+                "work dir manually to validate."
+            )
+            log.info(
+                "Build validation skipped because push is disabled "
+                "(--no-push). Inspect the work dir manually."
             )
         else:
             try:
@@ -924,7 +1044,12 @@ def main(argv: list[str] | None = None) -> int:
     except PublishError as exc:
         log.error("Publish failed: %s", exc)
         return 1
-    if result.validation_skipped and not result.pushed:
+    # Exit code 3 is reserved for the "tooling-missing skip" path: the
+    # push was *requested* (no ``--no-push``) but couldn't happen
+    # because ``validate_astro_build`` couldn't run.  An intentional
+    # ``--no-push`` dry run also reports ``validation_skipped`` but is
+    # a successful run from the user's perspective, so we return 0 there.
+    if result.validation_skipped and not result.pushed and not args.no_push:
         log.error(
             "Build validation skipped (%s) and push aborted. The new "
             "entry is at %s; install Node.js, then run "
