@@ -554,7 +554,7 @@ def build_static_optional(output_dir: Path) -> None:
         log.warning("Static viewer emission failed: %s", exc)
 
 
-def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> None:
+def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> bool:
     """Optional Git-backed Astro publish step.
 
     Only runs when ``--publish-git`` is set. Clones a host Astro
@@ -562,9 +562,13 @@ def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> None:
     behaviour (local filesystem output) is unchanged when this flag is
     omitted, so this step is purely additive and any failure here
     leaves the local ``wiki.mdx``/``index.html`` deliverables intact.
+
+    Returns ``True`` when the publish completed (or was a successful
+    dry run), ``False`` when build validation was skipped due to
+    missing tooling so the orchestrator can propagate exit code 3.
     """
     if not args.publish_git:
-        return
+        return True
     publisher = Path(__file__).parent / "publish_git.py"
     if not publisher.exists():
         raise RuntimeError(
@@ -588,7 +592,35 @@ def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> None:
         push=not args.no_push,
         work_dir=work_dir,
         keep_work_dir=args.keep_wiki_work_dir,
+        skip_build_validation=args.skip_build_validation,
     )
+    # ``tooling_missing`` is the dedicated signal from ``publish()`` for
+    # "node/npm not on PATH and a push was requested".  ``--no-push`` and
+    # ``--skip-build-validation`` runs also flip ``validation_skipped``,
+    # but they are not degraded outcomes from the user's perspective, so
+    # branching on the inferred combination would over-report.
+    if result.tooling_missing:
+        # ``publish()`` bails before staging in this branch, so the
+        # entry is only on the working tree.  Manual recovery requires
+        # ``git add`` + ``git commit`` + ``git push`` after the build;
+        # scope the ``git add`` to the slug directory so validation
+        # artifacts (``node_modules/``, ``package-lock.json``, ``.astro/``,
+        # ``dist/``) don't end up in the publish commit.
+        slug_path = f"src/content/wikis/{result.slug}"
+        log.warning(
+            "Published %s locally to %s but DID NOT push: build "
+            "validation %s. Install Node.js, then in the host clone "
+            "run: `npm install && npm run build && git add -- %s && "
+            "git commit -m 'deep-wiki: update %s' && git push origin %s`. "
+            "Or re-run with --skip-build-validation to bypass.",
+            result.slug,
+            result.entry_path,
+            result.validation_skipped_reason,
+            slug_path,
+            result.slug,
+            result.branch,
+        )
+        return False
     log.info(
         "Published %s -> %s (commit=%s pushed=%s)",
         result.slug,
@@ -596,12 +628,13 @@ def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> None:
         result.commit_sha or "<no-change>",
         result.pushed,
     )
+    return True
 
 
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
-def generate_wiki(args: argparse.Namespace) -> Path:
+def generate_wiki(args: argparse.Namespace) -> tuple[Path, bool]:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     prompts_dir = Path(__file__).parent.parent / "prompts"
@@ -658,11 +691,11 @@ def generate_wiki(args: argparse.Namespace) -> Path:
         if not args.no_static:
             build_static_optional(output_dir)
 
-        publish_git_optional(args, output_dir)
+        publish_ok = publish_git_optional(args, output_dir)
 
         elapsed = time.monotonic() - started
         log.info("✓ Wiki generated in %.1fs -> %s", elapsed, wiki_path)
-        return wiki_path
+        return wiki_path, publish_ok
     finally:
         if cleanup_workspace:
             log.info("Cleaning up workspace %s", workspace_dir)
@@ -800,6 +833,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Commit locally only; do not push the host repo (dry-run)",
     )
+    p.add_argument(
+        "--skip-build-validation",
+        action="store_true",
+        help=(
+            "Skip the pre-push `astro build` validation against the host "
+            "repo clone. Use only when CI does the same check; otherwise "
+            "broken MDX/YAML can land on the deployed site."
+        ),
+    )
     p.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
     return p
 
@@ -824,7 +866,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        generate_wiki(args)
+        _, publish_ok = generate_wiki(args)
     except KeyboardInterrupt:
         log.error("Interrupted")
         return 130
@@ -833,6 +875,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.verbose:
             raise
         return 1
+    # Exit code 3 mirrors publish_git's: the wiki was generated locally
+    # but the host repo could not be updated because build-validation
+    # tooling (node/npm) was missing.  Distinguishes "fix your env" from
+    # "everything succeeded" (0) or "hard failure" (1).
+    if not publish_ok:
+        return 3
     return 0
 
 

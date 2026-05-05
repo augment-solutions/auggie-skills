@@ -35,9 +35,16 @@ Before invoking the skill, make sure the user has:
 - Optional, for `--publish-git`: `git` on `$PATH` (already required
   for the clone step) plus push access to the host Astro repo. Auth
   via `GITHUB_TOKEN`/`GH_TOKEN` env var (HTTPS clone) or a configured
-  SSH key (SSH clone). When the host repo URL is missing or auth
-  fails, the publish step aborts with an actionable error before
-  touching anything; the local filesystem output is unaffected.
+  SSH key (SSH clone). **Also requires `node` + `npm`** so the
+  publish step can run `astro build` against the host clone before
+  pushing — that pre-flight catches malformed MDX/YAML so a broken
+  entry never lands on the deployed site. When `node`/`npm` aren't
+  available the publish step skips the push and emits a
+  manual-recovery summary; pass `--skip-build-validation` to bypass
+  validation entirely (only safe when CI re-runs the same check).
+  When the host repo URL is missing or auth fails, the publish step
+  aborts with an actionable error before touching anything; the
+  local filesystem output is unaffected.
 
 If any prerequisite is missing, tell the user and stop — do not attempt to
 install software on their behalf without permission.
@@ -104,6 +111,9 @@ Common flags:
 - `--no-push`: commit into a temp clone but do not push (dry-run).
 - `--wiki-work-dir <path>` / `--keep-wiki-work-dir`: persist the
   clone for inspection (default is an ephemeral temp dir).
+- `--skip-build-validation`: skip the local `npm run build`
+  pre-flight against the host clone (default is to run it; only set
+  when CI re-runs the same check).
 - `--verbose` (`-v`): debug logs.
 
 `--help` lists all flags.
@@ -129,17 +139,44 @@ What happens, in order:
    language, topics) and written to
    `src/content/wikis/<slug>/index.mdx`. Any existing directory for
    the same slug is replaced atomically; other wikis are untouched.
-4. `git add` / `git commit -m "deep-wiki: update <slug>"`. If the
+4. `npm install` (only when `node_modules/` is missing **or** the
+   host repo's `package.json`/`package-lock.json` changed since the
+   last run) followed by `npm run build` (i.e. `astro build`) is run
+   inside the clone. Any build error — bad YAML frontmatter,
+   unclosed Mermaid block, broken JSX — aborts the publish before
+   commit/push so the host repo stays green. The clone is preserved
+   on build failure (default ephemeral temp dir or an explicit
+   `--wiki-work-dir`) so you can `cd` in, reproduce locally with
+   `npm run build`, and iterate without re-cloning. If `node`/`npm`
+   aren't available, this step is skipped and the publish bails out
+   with a manual-recovery summary (no commit, no push); pass
+   `--skip-build-validation` to bypass. `--no-push` (dry run) skips
+   this step automatically since nothing is being pushed.
+5. `git add` / `git commit -m "deep-wiki: update <slug>"`. If the
    index is empty (idempotent re-run), the commit is skipped.
-5. `git push origin <branch>`. On a non-fast-forward rejection (a
+6. `git push origin <branch>`. On a non-fast-forward rejection (a
    concurrent publish from another session), the script
    `pull --rebase`s and retries up to 3 times.
-6. The host site's CD (Vercel auto-deploy on push, GitHub Pages
+7. The host site's CD (Vercel auto-deploy on push, GitHub Pages
    action, etc.) rebuilds and the wiki appears at `/wikis/<slug>/`.
 
 Multi-wiki layout: every wiki is one entry in the `wikis` content
 collection, so a single host repo hosts all of them. The landing page
 (`/`) lists everything; each wiki lives at `/wikis/<slug>/`.
+
+### Exit codes
+
+`generate_wiki.py` and `publish_git.py` share the following exit codes
+so CI can branch on them:
+
+- `0`: success (or successful `--no-push` dry run).
+- `1`: hard failure (clone error, build failure, push rejected, etc.).
+- `2`: prerequisites missing (`auggie`/`git` not on PATH).
+- `3`: wiki generated locally, but the host repo was **not** updated
+  because build-validation tooling (`node`/`npm`) was missing.
+  Install Node.js and re-run, or pass `--skip-build-validation` to
+  bypass.
+- `130`: interrupted (Ctrl-C).
 
 ## Output layout
 

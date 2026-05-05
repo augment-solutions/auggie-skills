@@ -261,8 +261,13 @@ class TestPublish:
         # Use an explicit work_dir under tmp_path so pytest cleans up after
         # the test; otherwise publish() with ``push=False`` would leave a
         # ``deep-wikis-clone-*`` dir in the system temp directory.
+        # ``skip_build_validation`` keeps these tests focused on the
+        # arg/env wiring; ``validate_astro_build`` has its own coverage.
         result = pg.publish(
-            output_dir=out, work_dir=tmp_path / "clone-env", push=False
+            output_dir=out,
+            work_dir=tmp_path / "clone-env",
+            push=False,
+            skip_build_validation=True,
         )
         assert captured["repo_url"] == "https://github.com/x/y.git"
         assert captured["branch"] == "main"
@@ -289,6 +294,7 @@ class TestPublish:
             wiki_repo="https://github.com/x/explicit.git",
             work_dir=tmp_path / "clone-explicit",
             push=False,
+            skip_build_validation=True,
         )
         assert captured["repo_url"] == "https://github.com/x/explicit.git"
 
@@ -367,6 +373,106 @@ class TestRedact:
         rendered = pg._redact_cmd(cmd)
         assert "ghp_topsecret" not in rendered
         assert "Bearer ***" in rendered
+
+    # The npm-install failure tail can include ``.npmrc``-style auth
+    # credentials when a transitive dep names a private registry.
+    # ``_redact`` must mask each documented form before the tail lands
+    # in a ``PublishError`` (and thus in CI logs).
+    @pytest.mark.parametrize(
+        "raw, secret",
+        [
+            ("//registry.npmjs.org/:_authToken=npm_abc123def", "npm_abc123def"),
+            ("_authToken=ghp_supersecret", "ghp_supersecret"),
+            ("//registry.example.com/:_auth=dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("_password=base64encodedpw", "base64encodedpw"),
+            ("Authorization: Bearer xoxb-slack-token-9999", "xoxb-slack-token-9999"),
+        ],
+    )
+    def test_masks_npm_credentials(self, raw, secret):
+        redacted = pg._redact(raw)
+        assert secret not in redacted
+        assert "***" in redacted
+
+    def test_masks_inside_multiline_build_output(self):
+        # Mirror what an npm-install failure tail actually looks like.
+        log_block = (
+            "npm error code E401\n"
+            "npm error 401 Unauthorized - GET https://registry.example.com/foo\n"
+            "npm error 401 In most cases you or one of your dependencies are\n"
+            "//registry.example.com/:_authToken=ghs_topsecret_token_xyz\n"
+            "//registry.example.com/:_password=YmFzZTY0cHc=\n"
+            "Authorization: Bearer ghp_alsosecret\n"
+        )
+        redacted = pg._redact(log_block)
+        for needle in (
+            "ghs_topsecret_token_xyz", "YmFzZTY0cHc=", "ghp_alsosecret"
+        ):
+            assert needle not in redacted
+
+
+# ---------------------------------------------------------------------------
+# _format_proc_tail — independent stderr/stdout tailing for failure reports
+# ---------------------------------------------------------------------------
+class TestFormatProcTail:
+    """``_format_proc_tail`` must surface the actual error even when one
+    stream dominates the captured output.  Concatenating ``stderr`` and
+    ``stdout`` before truncation -- which the previous helper did --
+    let a chatty ``npm install`` / ``astro build`` ``stdout`` push the
+    real error (almost always on ``stderr``) past the truncation
+    window, leaving operators staring at progress noise.
+    """
+
+    def _proc(self, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(
+            args=["x"], returncode=1, stdout=stdout, stderr=stderr,
+        )
+
+    def test_long_stdout_does_not_hide_stderr(self):
+        # ``npm install`` reliably prints hundreds of progress lines on
+        # stdout while the actual error sits on stderr.  The helper
+        # must show both.
+        noisy_stdout = "\n".join(f"npm sill progress {i}" for i in range(500))
+        real_error = "npm ERR! code E401\nnpm ERR! 401 Unauthorized"
+        out = pg._format_proc_tail(self._proc(stdout=noisy_stdout, stderr=real_error))
+        assert "npm ERR! code E401" in out
+        assert "npm ERR! 401 Unauthorized" in out
+        # Stream labels make the section boundaries explicit so the
+        # operator can see which side the error came from.
+        assert "stderr" in out
+        assert "stdout" in out
+
+    def test_each_stream_is_independently_truncated(self):
+        # Both streams over the limit must each contribute up to the
+        # tail limit -- not a shared budget.
+        big_stdout = "\n".join(f"out-{i}" for i in range(pg.BUILD_OUTPUT_TAIL_LINES * 3))
+        big_stderr = "\n".join(f"err-{i}" for i in range(pg.BUILD_OUTPUT_TAIL_LINES * 3))
+        out = pg._format_proc_tail(self._proc(stdout=big_stdout, stderr=big_stderr))
+        # Last lines of each stream are present.
+        assert f"out-{pg.BUILD_OUTPUT_TAIL_LINES * 3 - 1}" in out
+        assert f"err-{pg.BUILD_OUTPUT_TAIL_LINES * 3 - 1}" in out
+        # Earliest lines were truncated from both.
+        assert "out-0\n" not in out
+        assert "err-0\n" not in out
+
+    def test_credentials_redacted_in_both_streams(self):
+        out = pg._format_proc_tail(self._proc(
+            stdout="//registry.example.com/:_authToken=ghp_stdout_secret\n",
+            stderr="Authorization: Bearer ghp_stderr_secret\n",
+        ))
+        assert "ghp_stdout_secret" not in out
+        assert "ghp_stderr_secret" not in out
+
+    def test_stdout_only_emits_only_stdout_section(self):
+        out = pg._format_proc_tail(self._proc(stdout="just stdout"))
+        assert "stdout" in out
+        # No empty "stderr" section.
+        assert "stderr" not in out
+
+    def test_no_output_falls_back_to_placeholder(self):
+        out = pg._format_proc_tail(self._proc())
+        # An empty subprocess output should produce *something* the
+        # operator can grep for instead of a silent blank line.
+        assert out.strip() != ""
 
 
 class TestRunHelper:
@@ -521,7 +627,7 @@ class TestPublishNoPushPreservesWorkDir:
         monkeypatch.setattr(pg, "clone_host_repo", fake_clone)
         monkeypatch.setattr(pg, "commit_and_push", lambda *a, **kw: ("abc", False))
 
-        result = pg.publish(output_dir=out, push=False)
+        result = pg.publish(output_dir=out, push=False, skip_build_validation=True)
         assert result.pushed is False
         # The clone target lives under a temp dir that publish() must not
         # delete when push is disabled — operators rely on it for inspection.
@@ -616,6 +722,7 @@ class TestDeriveSlugFallback:
             wiki_repo="https://github.com/x/y.git",
             work_dir=tmp_path / "clone",
             push=False,
+            skip_build_validation=True,
         )
         assert result.slug == "wiki"
 
@@ -623,6 +730,111 @@ class TestDeriveSlugFallback:
 # ---------------------------------------------------------------------------
 # commit_and_push — push-rejection retry only fires on non-fast-forward
 # ---------------------------------------------------------------------------
+class TestCommitAndPushScoping:
+    """``commit_and_push`` must only stage the slug directory, never
+    tooling artifacts that ``validate_astro_build`` may have left in
+    the work dir (most notably ``package-lock.json`` from ``npm install``
+    on the bare host-repo template).
+    """
+
+    @staticmethod
+    def _git(*args: str, cwd: Path) -> None:
+        env = os.environ.copy()
+        env.update(
+            {
+                "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e",
+            }
+        )
+        subprocess.run(
+            ["git", *args], cwd=cwd, env=env, check=True, capture_output=True,
+        )
+
+    def _init_host_repo(self, tmp_path: Path) -> Path:
+        """Init a real on-disk git repo with the host-repo layout."""
+        work_dir = tmp_path / "host"
+        work_dir.mkdir()
+        self._git("init", "--initial-branch=main", cwd=work_dir)
+        self._git("config", "commit.gpgsign", "false", cwd=work_dir)
+        # seed with an empty initial commit so HEAD exists
+        self._git("commit", "--allow-empty", "-m", "init", cwd=work_dir)
+        (work_dir / "src" / "content" / "wikis").mkdir(parents=True)
+        return work_dir
+
+    def test_only_slug_dir_is_staged(self, tmp_path):
+        """A stray ``package-lock.json`` from ``npm install`` must NOT
+        end up in the publish commit.
+        """
+        work_dir = self._init_host_repo(tmp_path)
+        # write the wiki entry inside the content collection
+        slug_dir = work_dir / "src" / "content" / "wikis" / "abc"
+        slug_dir.mkdir(parents=True)
+        (slug_dir / "index.mdx").write_text("---\ntitle: x\n---\n")
+        # simulate the validation side effects: a tooling artifact at
+        # the repo root that git would otherwise pick up via ``-A``
+        (work_dir / "package-lock.json").write_text('{"lockfileVersion": 3}')
+        (work_dir / "package.json").write_text('{"name": "site"}')
+
+        sha, pushed = pg.commit_and_push(
+            work_dir,
+            slug="abc", branch="main", push=False, token=None,
+            author_name="t", author_email="t@e",
+        )
+        assert sha is not None
+        assert pushed is False
+        # Inspect what was actually committed
+        proc = subprocess.run(
+            ["git", "show", "--name-only", "--pretty=", "HEAD"],
+            cwd=work_dir, check=True, capture_output=True, text=True,
+        )
+        committed = {ln.strip() for ln in proc.stdout.splitlines() if ln.strip()}
+        assert committed == {"src/content/wikis/abc/index.mdx"}
+        assert "package-lock.json" not in committed
+        assert "package.json" not in committed
+        # And the stray files remain untracked in the working tree
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=work_dir, check=True, capture_output=True, text=True,
+        )
+        # Both untracked artifacts should still appear as ``??`` entries
+        statuses = [ln for ln in proc.stdout.splitlines() if ln]
+        assert any("package-lock.json" in ln for ln in statuses)
+        assert any("package.json" in ln for ln in statuses)
+
+    def test_no_changes_in_slug_dir_skips_commit(self, tmp_path):
+        """Even with stray tooling artifacts present, if the slug
+        itself didn't change, no commit must be created.
+        """
+        work_dir = self._init_host_repo(tmp_path)
+        # commit an existing wiki entry first
+        slug_dir = work_dir / "src" / "content" / "wikis" / "abc"
+        slug_dir.mkdir(parents=True)
+        (slug_dir / "index.mdx").write_text("---\ntitle: x\n---\n")
+        self._git("add", "src/content/wikis/abc", cwd=work_dir)
+        self._git("commit", "-m", "seed", cwd=work_dir)
+        head_before = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=work_dir, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        # Now drop a stray lockfile (npm install side effect) but
+        # leave the slug content untouched.
+        (work_dir / "package-lock.json").write_text('{"lockfileVersion": 3}')
+
+        sha, pushed = pg.commit_and_push(
+            work_dir,
+            slug="abc", branch="main", push=False, token=None,
+            author_name="t", author_email="t@e",
+        )
+        assert sha is None
+        assert pushed is False
+        head_after = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=work_dir, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        # No new commit was created.
+        assert head_before == head_after
+
+
 class TestPushRetryClassification:
     """The retry loop must only rebase-and-retry on the canonical
     non-fast-forward signals; protected-branch / hook rejections must
@@ -686,3 +898,499 @@ class TestPushRetryClassification:
         # Each failed push is followed by a pull --rebase before retrying.
         assert sum(1 for c in calls if "push" in c) == pg.PUSH_RETRIES
         assert sum(1 for c in calls if "pull" in c and "--rebase" in c) == pg.PUSH_RETRIES
+
+
+# ---------------------------------------------------------------------------
+# validate_astro_build — tooling missing / install / build failure / success
+# ---------------------------------------------------------------------------
+class TestValidateAstroBuild:
+    """Cover the three observable outcomes of ``validate_astro_build``:
+    tooling missing (skip-with-summary), build failure (PublishError,
+    no push), and success (no raise).
+    """
+
+    def _seed_host_repo(self, tmp_path: Path) -> Path:
+        target = tmp_path / "deep-wikis"
+        target.mkdir()
+        (target / "package.json").write_text('{"name": "x"}')
+        return target
+
+    def test_missing_node_raises_build_tooling_missing(self, tmp_path, monkeypatch):
+        # Both ``node`` and ``npm`` absent from PATH.
+        monkeypatch.setattr(pg.shutil, "which", lambda _: None)
+        target = self._seed_host_repo(tmp_path)
+        with pytest.raises(pg.BuildToolingMissing) as excinfo:
+            pg.validate_astro_build(target)
+        msg = str(excinfo.value)
+        assert "node" in msg and "npm" in msg
+
+    def test_only_npm_missing_raises_build_tooling_missing(self, tmp_path, monkeypatch):
+        # ``node`` present, ``npm`` missing — still a skip case.
+        monkeypatch.setattr(
+            pg.shutil, "which", lambda tool: "/usr/local/bin/node" if tool == "node" else None
+        )
+        with pytest.raises(pg.BuildToolingMissing) as excinfo:
+            pg.validate_astro_build(self._seed_host_repo(tmp_path))
+        msg = str(excinfo.value)
+        # Only ``npm`` should be flagged as missing on the PATH report;
+        # the ``node`` token may still appear in the install hint.
+        path_line = msg.split("PATH:", 1)[1]
+        assert "npm" in path_line
+        assert "node" not in path_line.split("(", 1)[0]
+
+    def test_missing_package_json_raises_publish_error(self, tmp_path, monkeypatch):
+        # Tooling present but the host repo isn't an Astro project.
+        monkeypatch.setattr(pg.shutil, "which", lambda _: "/usr/local/bin/" + _)
+        target = tmp_path / "deep-wikis"
+        target.mkdir()
+        with pytest.raises(pg.PublishError, match="no package.json"):
+            pg.validate_astro_build(target)
+
+    def test_npm_install_runs_when_node_modules_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pg.shutil, "which", lambda _: "/usr/local/bin/" + _)
+        target = self._seed_host_repo(tmp_path)
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(pg, "_run", fake_run)
+        pg.validate_astro_build(target)
+
+        # Expect `npm install ...` followed by `npm run build ...`.
+        assert calls[0][:2] == ["npm", "install"]
+        assert ["npm", "run", "build"] == calls[1][:3]
+
+    def test_npm_install_skipped_when_node_modules_exists(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pg.shutil, "which", lambda _: "/usr/local/bin/" + _)
+        target = self._seed_host_repo(tmp_path)
+        (target / "node_modules").mkdir()
+        # Seed the sentinel that records the manifest hash from the last
+        # successful install so freshness check returns ``True``.
+        (target / "node_modules" / pg._PKG_HASH_SENTINEL).write_text(
+            pg._pkg_manifest_hash(target)
+        )
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(pg, "_run", fake_run)
+        pg.validate_astro_build(target)
+
+        # Only `npm run build` — no `npm install` call.
+        assert all(c[:2] != ["npm", "install"] for c in calls)
+        assert any(c[:3] == ["npm", "run", "build"] for c in calls)
+
+    def test_pkg_manifest_drift_forces_reinstall(self, tmp_path, monkeypatch):
+        """When ``package.json`` changes between runs, the cached
+        ``node_modules`` must be discarded and reinstalled."""
+        monkeypatch.setattr(pg.shutil, "which", lambda _: "/usr/local/bin/" + _)
+        target = self._seed_host_repo(tmp_path)
+        node_modules = target / "node_modules"
+        node_modules.mkdir()
+        # Pretend a previous run installed against a different manifest.
+        (node_modules / pg._PKG_HASH_SENTINEL).write_text("stale-hash")
+        # Drop a fake nested file so we can verify the rmtree happened.
+        (node_modules / "leftover.txt").write_text("from previous run")
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            # Simulate npm install actually creating node_modules anew.
+            if cmd[:2] == ["npm", "install"]:
+                node_modules.mkdir(exist_ok=True)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(pg, "_run", fake_run)
+        pg.validate_astro_build(target)
+
+        # npm install ran (drift forced reinstall) before the build.
+        assert calls[0][:2] == ["npm", "install"]
+        # The leftover from the prior run was removed.
+        assert not (node_modules / "leftover.txt").exists()
+        # New sentinel matches the current manifest.
+        assert (node_modules / pg._PKG_HASH_SENTINEL).read_text() == pg._pkg_manifest_hash(target)
+
+    def test_npm_install_failure_becomes_publish_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pg.shutil, "which", lambda _: "/usr/local/bin/" + _)
+        target = self._seed_host_repo(tmp_path)
+
+        def fake_run(cmd, **kw):
+            if cmd[:2] == ["npm", "install"]:
+                # Simulate a partial install: node_modules exists but
+                # nothing inside it is usable.
+                (target / "node_modules").mkdir(exist_ok=True)
+                (target / "node_modules" / "half-installed.txt").write_text("oops")
+                return subprocess.CompletedProcess(cmd, 1, "", "EACCES denied")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(pg, "_run", fake_run)
+        with pytest.raises(pg.PublishError, match="npm install failed"):
+            pg.validate_astro_build(target)
+        # Failure cleanup: the partial node_modules tree is removed so
+        # the next run starts clean instead of silently reusing it.
+        assert not (target / "node_modules").exists()
+
+    def test_build_failure_becomes_publish_error_with_tail(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pg.shutil, "which", lambda _: "/usr/local/bin/" + _)
+        target = self._seed_host_repo(tmp_path)
+        (target / "node_modules").mkdir()
+        long_err = "\n".join(f"line-{i}" for i in range(200))
+
+        def fake_run(cmd, **kw):
+            if cmd[:3] == ["npm", "run", "build"]:
+                return subprocess.CompletedProcess(cmd, 1, long_err, "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(pg, "_run", fake_run)
+        with pytest.raises(pg.PublishError) as excinfo:
+            pg.validate_astro_build(target)
+        msg = str(excinfo.value)
+        assert "astro build failed" in msg
+        # Last lines should be present, earliest should be elided.
+        assert "line-199" in msg
+        assert "line-0" not in msg
+
+
+
+# ---------------------------------------------------------------------------
+# publish() integration with build validation
+# ---------------------------------------------------------------------------
+class TestPublishBuildValidationIntegration:
+    """Verify ``publish()`` wires up ``validate_astro_build`` correctly:
+    skip-with-summary on missing tooling, hard-fail on build error, and
+    bypass when ``skip_build_validation=True``.
+    """
+
+    def _make_output(self, tmp_path: Path) -> Path:
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "wiki.mdx").write_text("---\n# T\n---\n")
+        (out / "repo_metadata.json").write_text(
+            '{"owner": "pallets", "name": "click"}'
+        )
+        return out
+
+    def _seed_clone(self, monkeypatch):
+        """Stub ``clone_host_repo`` to set up the minimum host-repo layout
+        ``write_entry`` and ``validate_astro_build`` need.
+        """
+        def fake_clone(repo_url, branch, work_dir, *, token):
+            (work_dir / "src" / "content" / "wikis").mkdir(parents=True)
+            (work_dir / "package.json").write_text('{"name": "x"}')
+        monkeypatch.setattr(pg, "clone_host_repo", fake_clone)
+
+    def test_skip_flag_bypasses_validation_and_pushes(self, tmp_path, monkeypatch):
+        out = self._make_output(tmp_path)
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        self._seed_clone(monkeypatch)
+
+        validate_called = {"count": 0}
+
+        def fake_validate(*a, **kw):
+            validate_called["count"] += 1
+
+        monkeypatch.setattr(pg, "validate_astro_build", fake_validate)
+        monkeypatch.setattr(pg, "commit_and_push", lambda *a, **kw: ("abc", True))
+
+        result = pg.publish(
+            output_dir=out,
+            work_dir=tmp_path / "clone",
+            skip_build_validation=True,
+        )
+        assert validate_called["count"] == 0
+        assert result.pushed is True
+        assert result.validation_skipped is True
+        assert "bypassed" in (result.validation_skipped_reason or "")
+        # ``--skip-build-validation`` is operator intent, NOT missing
+        # tooling: the CLI must not flip to exit 3 in this case.
+        assert result.tooling_missing is False
+
+    def test_skip_flag_with_idempotent_no_op_does_not_signal_tooling_missing(
+        self, tmp_path, monkeypatch,
+    ):
+        """Regression for the false-positive flagged in PR #3 review:
+        ``--skip-build-validation`` plus an idempotent run that has
+        nothing to push results in
+        ``validation_skipped=True`` + ``pushed=False`` + push requested,
+        which used to satisfy the heuristic exit-3 check.  The
+        dedicated ``tooling_missing`` flag must stay False so callers
+        treat this as a successful no-op.
+        """
+        out = self._make_output(tmp_path)
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        self._seed_clone(monkeypatch)
+
+        monkeypatch.setattr(pg, "validate_astro_build", lambda *a, **kw: None)
+        # ``commit_and_push`` returns ``pushed=False`` to model "index
+        # was empty, nothing to commit" -- the idempotent re-run path.
+        monkeypatch.setattr(pg, "commit_and_push", lambda *a, **kw: (None, False))
+
+        result = pg.publish(
+            output_dir=out,
+            work_dir=tmp_path / "clone",
+            skip_build_validation=True,
+        )
+        assert result.validation_skipped is True
+        assert result.pushed is False
+        assert result.tooling_missing is False
+
+    def test_missing_tooling_skips_push_and_preserves_workdir(
+        self, tmp_path, monkeypatch
+    ):
+        out = self._make_output(tmp_path)
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        self._seed_clone(monkeypatch)
+
+        def raise_missing(*a, **kw):
+            raise pg.BuildToolingMissing("required build tooling not found on PATH: node, npm")
+
+        commit_called = {"count": 0}
+
+        def fake_commit(*a, **kw):
+            commit_called["count"] += 1
+            return ("abc", True)
+
+        monkeypatch.setattr(pg, "validate_astro_build", raise_missing)
+        monkeypatch.setattr(pg, "commit_and_push", fake_commit)
+
+        clone_dir = tmp_path / "clone"
+        result = pg.publish(output_dir=out, work_dir=clone_dir)
+
+        # No commit, no push, but the entry was written and the dir lives.
+        assert commit_called["count"] == 0
+        assert result.pushed is False
+        assert result.validation_skipped is True
+        assert "node" in (result.validation_skipped_reason or "")
+        assert result.tooling_missing is True
+        assert clone_dir.is_dir()
+
+    def test_build_failure_propagates_and_skips_push(self, tmp_path, monkeypatch):
+        out = self._make_output(tmp_path)
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        self._seed_clone(monkeypatch)
+
+        def raise_build_error(*a, **kw):
+            raise pg.PublishError("astro build failed: bad indentation")
+
+        commit_called = {"count": 0}
+
+        def fake_commit(*a, **kw):
+            commit_called["count"] += 1
+            return ("abc", True)
+
+        monkeypatch.setattr(pg, "validate_astro_build", raise_build_error)
+        monkeypatch.setattr(pg, "commit_and_push", fake_commit)
+
+        with pytest.raises(pg.PublishError, match="astro build failed"):
+            pg.publish(output_dir=out, work_dir=tmp_path / "clone")
+        assert commit_called["count"] == 0
+
+    def test_build_failure_preserves_default_temp_clone(
+        self, tmp_path, monkeypatch,
+    ):
+        """SKILL.md promises the clone is preserved on build failure so
+        the operator can ``cd`` in and reproduce locally.  That has to
+        hold for the *default* (no ``--work-dir``) ephemeral-temp path
+        too, not just for the explicit ``--work-dir`` case -- otherwise
+        the docs lie.  Capture the temp dir ``publish()`` chose via
+        ``tempfile.mkdtemp`` and assert it's still on disk after the
+        ``PublishError`` propagates out.
+        """
+        out = self._make_output(tmp_path)
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        self._seed_clone(monkeypatch)
+
+        # Capture every directory ``mkdtemp`` hands out so we can check
+        # it survived after the failure.  We don't override the helper;
+        # we just record what it returns.
+        created: list[str] = []
+        real_mkdtemp = pg.tempfile.mkdtemp
+
+        def recording_mkdtemp(*a, **kw):
+            d = real_mkdtemp(*a, **kw)
+            created.append(d)
+            return d
+
+        monkeypatch.setattr(pg.tempfile, "mkdtemp", recording_mkdtemp)
+        monkeypatch.setattr(
+            pg, "validate_astro_build",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                pg.PublishError("astro build failed: bad mdx")
+            ),
+        )
+        monkeypatch.setattr(pg, "commit_and_push", lambda *a, **kw: ("x", True))
+
+        with pytest.raises(pg.PublishError, match="astro build failed"):
+            pg.publish(output_dir=out)  # no work_dir => default temp path
+
+        # Exactly one temp dir was allocated and it is still on disk.
+        assert len(created) == 1
+        assert Path(created[0]).is_dir()
+        # And the cloned host repo inside it survived too (this is what
+        # the operator actually wants to inspect).
+        assert (Path(created[0]) / "deep-wikis").is_dir()
+
+    def test_validation_success_proceeds_to_push(self, tmp_path, monkeypatch):
+        out = self._make_output(tmp_path)
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        self._seed_clone(monkeypatch)
+
+        validate_called = {"count": 0}
+        commit_called = {"count": 0}
+
+        def fake_validate(*a, **kw):
+            validate_called["count"] += 1
+
+        def fake_commit(*a, **kw):
+            commit_called["count"] += 1
+            return ("deadbeef", True)
+
+        monkeypatch.setattr(pg, "validate_astro_build", fake_validate)
+        monkeypatch.setattr(pg, "commit_and_push", fake_commit)
+
+        result = pg.publish(output_dir=out, work_dir=tmp_path / "clone")
+        assert validate_called["count"] == 1
+        assert commit_called["count"] == 1
+        assert result.pushed is True
+        assert result.validation_skipped is False
+        assert result.validation_skipped_reason is None
+
+    def test_no_push_dry_run_skips_validation(self, tmp_path, monkeypatch):
+        """``--no-push`` is a dry run; paying the install/build cost is
+        wasteful and inconsistent with the operator's intent.  The
+        publisher should commit locally only and report the skip.
+        """
+        out = self._make_output(tmp_path)
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        self._seed_clone(monkeypatch)
+
+        validate_called = {"count": 0}
+
+        def fake_validate(*a, **kw):
+            validate_called["count"] += 1
+
+        monkeypatch.setattr(pg, "validate_astro_build", fake_validate)
+        monkeypatch.setattr(pg, "commit_and_push", lambda *a, **kw: ("abc", False))
+
+        result = pg.publish(
+            output_dir=out, work_dir=tmp_path / "clone", push=False,
+        )
+        # Validation never runs; the dry-run commit still happens.
+        assert validate_called["count"] == 0
+        assert result.pushed is False
+        assert result.validation_skipped is True
+        assert "dry run" in (result.validation_skipped_reason or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# CLI exit codes
+# ---------------------------------------------------------------------------
+class TestCliExitCodes:
+    """The ``main()`` exit code is part of the CLI contract; CI uses
+    it to distinguish failure modes from intentional skip states."""
+
+    def _setup(self, tmp_path, monkeypatch):
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "wiki.mdx").write_text("---\n# T\n---\n")
+        (out / "repo_metadata.json").write_text('{"owner": "o", "name": "n"}')
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        return out
+
+    def test_no_push_returns_zero_even_with_validation_skipped(
+        self, tmp_path, monkeypatch
+    ):
+        """``--no-push`` flips ``validation_skipped`` to True (dry-run
+        skip), but that is a successful run from the user's POV → 0.
+        """
+        out = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            pg, "publish",
+            lambda **_: pg.PublishResult(
+                repo_url="https://github.com/x/y.git", branch="main",
+                slug="o-n", entry_path=Path("src/content/wikis/o-n/index.mdx"),
+                commit_sha="abc", pushed=False,
+                validation_skipped=True,
+                validation_skipped_reason="dry run (--no-push); validation skipped",
+            ),
+        )
+        rc = pg.main([
+            "--output-dir", str(out), "--no-push",
+        ])
+        assert rc == 0
+
+    def test_tooling_missing_returns_three(self, tmp_path, monkeypatch, caplog):
+        """When push was *requested* but tooling was missing the CLI
+        returns 3 so callers can distinguish "fix your env" from
+        either success (0) or a hard failure (1).  The recovery hint
+        must include all four manual git steps (build + add + commit
+        + push), not just ``git push`` -- the publisher bails *before*
+        ``commit_and_push`` in this branch, so the entry is on the
+        working tree only.
+        """
+        out = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            pg, "publish",
+            lambda **_: pg.PublishResult(
+                repo_url="https://github.com/x/y.git", branch="main",
+                slug="o-n", entry_path=Path("src/content/wikis/o-n/index.mdx"),
+                commit_sha=None, pushed=False,
+                validation_skipped=True,
+                validation_skipped_reason="required build tooling not found on PATH: node, npm",
+                tooling_missing=True,
+            ),
+        )
+        with caplog.at_level("ERROR", logger="auggie-deep-wiki.publish-git"):
+            rc = pg.main(["--output-dir", str(out)])
+        assert rc == 3
+        recovery = "\n".join(r.getMessage() for r in caplog.records)
+        # All four steps must be in the hint, in order, scoped to the
+        # slug directory so build artifacts don't sneak into the commit.
+        assert "npm install" in recovery
+        assert "npm run build" in recovery
+        assert "git add -- src/content/wikis/o-n" in recovery
+        assert "git commit" in recovery
+        assert "git push origin main" in recovery
+        # And in the right order.
+        assert recovery.index("npm install") < recovery.index("git add")
+        assert recovery.index("git add") < recovery.index("git commit")
+        assert recovery.index("git commit") < recovery.index("git push")
+
+    def test_skip_validation_idempotent_returns_zero(
+        self, tmp_path, monkeypatch,
+    ):
+        """Regression for the false-positive in PR #3 review:
+        ``--skip-build-validation`` + idempotent run (no diff to push)
+        flips ``validation_skipped`` and ``pushed=False`` even though
+        push *was* requested.  The previous heuristic returned 3 here;
+        with the dedicated ``tooling_missing`` flag it must return 0.
+        """
+        out = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            pg, "publish",
+            lambda **_: pg.PublishResult(
+                repo_url="https://github.com/x/y.git", branch="main",
+                slug="o-n", entry_path=Path("src/content/wikis/o-n/index.mdx"),
+                commit_sha=None, pushed=False,
+                validation_skipped=True,
+                validation_skipped_reason="explicitly bypassed (--skip-build-validation)",
+                tooling_missing=False,
+            ),
+        )
+        rc = pg.main(["--output-dir", str(out), "--skip-build-validation"])
+        assert rc == 0
+
+    def test_publish_error_returns_one(self, tmp_path, monkeypatch):
+        out = self._setup(tmp_path, monkeypatch)
+
+        def boom(**_):
+            raise pg.PublishError("clone failed")
+
+        monkeypatch.setattr(pg, "publish", boom)
+        rc = pg.main(["--output-dir", str(out)])
+        assert rc == 1

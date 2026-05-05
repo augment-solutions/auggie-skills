@@ -246,6 +246,15 @@ Use `--no-push` to commit into the temp clone but stop before pushing
 (handy for inspecting the generated MDX), or `--keep-work-dir
 --work-dir /tmp/deep-wikis-clone` to preserve the clone for review.
 
+The publish step also runs `npm install` (when needed) + `npm run
+build` against the cloned host repo before pushing. That pre-flight
+catches malformed MDX/YAML frontmatter so the same error you'd see
+on the deploy provider (Vercel, Netlify, …) is surfaced locally —
+no commit, no push, host repo stays green. If `node`/`npm` aren't on
+your `$PATH`, the publish step skips and prints a recovery summary
+instead of pushing. Pass `--skip-build-validation` to bypass the
+check (use only when CI re-runs the same `astro build`).
+
 
 
 ## Quick start (agent)
