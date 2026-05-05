@@ -1041,6 +1041,38 @@ class TestPublishBuildValidationIntegration:
         assert result.pushed is True
         assert result.validation_skipped is True
         assert "bypassed" in (result.validation_skipped_reason or "")
+        # ``--skip-build-validation`` is operator intent, NOT missing
+        # tooling: the CLI must not flip to exit 3 in this case.
+        assert result.tooling_missing is False
+
+    def test_skip_flag_with_idempotent_no_op_does_not_signal_tooling_missing(
+        self, tmp_path, monkeypatch,
+    ):
+        """Regression for the false-positive flagged in PR #3 review:
+        ``--skip-build-validation`` plus an idempotent run that has
+        nothing to push results in
+        ``validation_skipped=True`` + ``pushed=False`` + push requested,
+        which used to satisfy the heuristic exit-3 check.  The
+        dedicated ``tooling_missing`` flag must stay False so callers
+        treat this as a successful no-op.
+        """
+        out = self._make_output(tmp_path)
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        self._seed_clone(monkeypatch)
+
+        monkeypatch.setattr(pg, "validate_astro_build", lambda *a, **kw: None)
+        # ``commit_and_push`` returns ``pushed=False`` to model "index
+        # was empty, nothing to commit" -- the idempotent re-run path.
+        monkeypatch.setattr(pg, "commit_and_push", lambda *a, **kw: (None, False))
+
+        result = pg.publish(
+            output_dir=out,
+            work_dir=tmp_path / "clone",
+            skip_build_validation=True,
+        )
+        assert result.validation_skipped is True
+        assert result.pushed is False
+        assert result.tooling_missing is False
 
     def test_missing_tooling_skips_push_and_preserves_workdir(
         self, tmp_path, monkeypatch
@@ -1069,6 +1101,7 @@ class TestPublishBuildValidationIntegration:
         assert result.pushed is False
         assert result.validation_skipped is True
         assert "node" in (result.validation_skipped_reason or "")
+        assert result.tooling_missing is True
         assert clone_dir.is_dir()
 
     def test_build_failure_propagates_and_skips_push(self, tmp_path, monkeypatch):
@@ -1091,6 +1124,51 @@ class TestPublishBuildValidationIntegration:
         with pytest.raises(pg.PublishError, match="astro build failed"):
             pg.publish(output_dir=out, work_dir=tmp_path / "clone")
         assert commit_called["count"] == 0
+
+    def test_build_failure_preserves_default_temp_clone(
+        self, tmp_path, monkeypatch,
+    ):
+        """SKILL.md promises the clone is preserved on build failure so
+        the operator can ``cd`` in and reproduce locally.  That has to
+        hold for the *default* (no ``--work-dir``) ephemeral-temp path
+        too, not just for the explicit ``--work-dir`` case -- otherwise
+        the docs lie.  Capture the temp dir ``publish()`` chose via
+        ``tempfile.mkdtemp`` and assert it's still on disk after the
+        ``PublishError`` propagates out.
+        """
+        out = self._make_output(tmp_path)
+        monkeypatch.setenv("DEEP_WIKIS_GIT_REPO", "https://github.com/x/y.git")
+        self._seed_clone(monkeypatch)
+
+        # Capture every directory ``mkdtemp`` hands out so we can check
+        # it survived after the failure.  We don't override the helper;
+        # we just record what it returns.
+        created: list[str] = []
+        real_mkdtemp = pg.tempfile.mkdtemp
+
+        def recording_mkdtemp(*a, **kw):
+            d = real_mkdtemp(*a, **kw)
+            created.append(d)
+            return d
+
+        monkeypatch.setattr(pg.tempfile, "mkdtemp", recording_mkdtemp)
+        monkeypatch.setattr(
+            pg, "validate_astro_build",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                pg.PublishError("astro build failed: bad mdx")
+            ),
+        )
+        monkeypatch.setattr(pg, "commit_and_push", lambda *a, **kw: ("x", True))
+
+        with pytest.raises(pg.PublishError, match="astro build failed"):
+            pg.publish(output_dir=out)  # no work_dir => default temp path
+
+        # Exactly one temp dir was allocated and it is still on disk.
+        assert len(created) == 1
+        assert Path(created[0]).is_dir()
+        # And the cloned host repo inside it survived too (this is what
+        # the operator actually wants to inspect).
+        assert (Path(created[0]) / "deep-wikis").is_dir()
 
     def test_validation_success_proceeds_to_push(self, tmp_path, monkeypatch):
         out = self._make_output(tmp_path)
@@ -1195,10 +1273,35 @@ class TestCliExitCodes:
                 commit_sha=None, pushed=False,
                 validation_skipped=True,
                 validation_skipped_reason="required build tooling not found on PATH: node, npm",
+                tooling_missing=True,
             ),
         )
         rc = pg.main(["--output-dir", str(out)])
         assert rc == 3
+
+    def test_skip_validation_idempotent_returns_zero(
+        self, tmp_path, monkeypatch,
+    ):
+        """Regression for the false-positive in PR #3 review:
+        ``--skip-build-validation`` + idempotent run (no diff to push)
+        flips ``validation_skipped`` and ``pushed=False`` even though
+        push *was* requested.  The previous heuristic returned 3 here;
+        with the dedicated ``tooling_missing`` flag it must return 0.
+        """
+        out = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            pg, "publish",
+            lambda **_: pg.PublishResult(
+                repo_url="https://github.com/x/y.git", branch="main",
+                slug="o-n", entry_path=Path("src/content/wikis/o-n/index.mdx"),
+                commit_sha=None, pushed=False,
+                validation_skipped=True,
+                validation_skipped_reason="explicitly bypassed (--skip-build-validation)",
+                tooling_missing=False,
+            ),
+        )
+        rc = pg.main(["--output-dir", str(out), "--skip-build-validation"])
+        assert rc == 0
 
     def test_publish_error_returns_one(self, tmp_path, monkeypatch):
         out = self._setup(tmp_path, monkeypatch)

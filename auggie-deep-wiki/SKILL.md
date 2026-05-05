@@ -145,11 +145,13 @@ What happens, in order:
    inside the clone. Any build error — bad YAML frontmatter,
    unclosed Mermaid block, broken JSX — aborts the publish before
    commit/push so the host repo stays green. The clone is preserved
-   on failure for inspection. If `node`/`npm` aren't available, this
-   step is skipped and the publish bails out with a manual-recovery
-   summary (no commit, no push); pass `--skip-build-validation` to
-   bypass. `--no-push` (dry run) skips this step automatically since
-   nothing is being pushed.
+   on build failure (default ephemeral temp dir or an explicit
+   `--wiki-work-dir`) so you can `cd` in, reproduce locally with
+   `npm run build`, and iterate without re-cloning. If `node`/`npm`
+   aren't available, this step is skipped and the publish bails out
+   with a manual-recovery summary (no commit, no push); pass
+   `--skip-build-validation` to bypass. `--no-push` (dry run) skips
+   this step automatically since nothing is being pushed.
 5. `git add` / `git commit -m "deep-wiki: update <slug>"`. If the
    index is empty (idempotent re-run), the commit is skipped.
 6. `git push origin <branch>`. On a non-fast-forward rejection (a

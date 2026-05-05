@@ -594,13 +594,12 @@ def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> bool:
         keep_work_dir=args.keep_wiki_work_dir,
         skip_build_validation=args.skip_build_validation,
     )
-    # ``--no-push`` is an intentional dry run; the publisher reports
-    # ``validation_skipped`` for it too, so distinguish before treating
-    # it as a degraded outcome.
-    tooling_skip = (
-        result.validation_skipped and not result.pushed and not args.no_push
-    )
-    if tooling_skip:
+    # ``tooling_missing`` is the dedicated signal from ``publish()`` for
+    # "node/npm not on PATH and a push was requested".  ``--no-push`` and
+    # ``--skip-build-validation`` runs also flip ``validation_skipped``,
+    # but they are not degraded outcomes from the user's perspective, so
+    # branching on the inferred combination would over-report.
+    if result.tooling_missing:
         log.warning(
             "Published %s locally to %s but DID NOT push: build "
             "validation %s. Install Node.js + run `npm install && "

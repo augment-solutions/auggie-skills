@@ -79,12 +79,23 @@ class PublishResult:
     entry_path: Path
     commit_sha: str | None
     pushed: bool
-    # Set when ``validate_astro_build`` could not run (e.g. ``npm`` missing
-    # in the publish environment).  When ``True`` the entry was written
-    # locally but the host repo was *not* committed/pushed; the operator
-    # has to run ``npm install && npm run build`` manually before pushing.
+    # Set when ``validate_astro_build`` was bypassed for *any* reason:
+    # ``--skip-build-validation``, ``--no-push`` dry runs, or missing
+    # ``node``/``npm`` tooling.  ``validation_skipped_reason`` carries a
+    # human-readable explanation; programmatic callers should branch on
+    # ``tooling_missing`` (below) for the recoverable-environment case
+    # rather than parsing the reason string.
     validation_skipped: bool = False
     validation_skipped_reason: str | None = None
+    # Set ONLY when validation was skipped because ``node``/``npm`` were
+    # absent from PATH and a push was requested (i.e. not ``--no-push``,
+    # not ``--skip-build-validation``).  This is the signal callers use
+    # to map to CLI exit code 3 ("install Node.js and re-run"); keeping
+    # it as its own boolean avoids inferring the case from the
+    # ``validation_skipped + not pushed + not --no-push`` combination,
+    # which is also true for an idempotent ``--skip-build-validation``
+    # run that had nothing to push.
+    tooling_missing: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +902,7 @@ def publish(
         #      install/build cost on every dry run would be wasteful.
         validation_skipped = False
         validation_skipped_reason: str | None = None
+        tooling_missing = False
         if skip_build_validation:
             validation_skipped = True
             validation_skipped_reason = "explicitly bypassed (--skip-build-validation)"
@@ -914,6 +926,7 @@ def publish(
             except BuildToolingMissing as exc:
                 validation_skipped = True
                 validation_skipped_reason = str(exc)
+                tooling_missing = True
                 log.warning(
                     "Build validation skipped: %s. Refusing to push so the "
                     "host repo stays green; entry left at %s for manual "
@@ -932,7 +945,17 @@ def publish(
                     pushed=False,
                     validation_skipped=validation_skipped,
                     validation_skipped_reason=validation_skipped_reason,
+                    tooling_missing=tooling_missing,
                 )
+            except PublishError:
+                # ``astro build`` itself rejected the entry (bad MDX,
+                # malformed YAML, broken JSX, ...).  SKILL.md promises
+                # the clone is preserved on build failure so the
+                # operator can ``cd`` in, reproduce locally, and iterate
+                # without re-cloning.  Suppress the cleanup before
+                # re-raising so the ``finally`` below leaves the dir.
+                cleanup_dir = None
+                raise
 
         sha, pushed = commit_and_push(
             target,
@@ -957,6 +980,7 @@ def publish(
             pushed=pushed,
             validation_skipped=validation_skipped,
             validation_skipped_reason=validation_skipped_reason,
+            tooling_missing=tooling_missing,
         )
     finally:
         if cleanup_dir is not None:
@@ -1045,11 +1069,14 @@ def main(argv: list[str] | None = None) -> int:
         log.error("Publish failed: %s", exc)
         return 1
     # Exit code 3 is reserved for the "tooling-missing skip" path: the
-    # push was *requested* (no ``--no-push``) but couldn't happen
-    # because ``validate_astro_build`` couldn't run.  An intentional
-    # ``--no-push`` dry run also reports ``validation_skipped`` but is
-    # a successful run from the user's perspective, so we return 0 there.
-    if result.validation_skipped and not result.pushed and not args.no_push:
+    # push was *requested* (no ``--no-push``, no ``--skip-build-validation``)
+    # but couldn't happen because ``validate_astro_build`` found neither
+    # ``node`` nor ``npm`` on PATH.  Branching on ``tooling_missing``
+    # (set only in that one branch of ``publish()``) avoids confusing
+    # this with idempotent ``--skip-build-validation`` runs that have
+    # nothing to push, or ``--no-push`` dry runs, both of which also
+    # report ``validation_skipped + not pushed``.
+    if result.tooling_missing:
         log.error(
             "Build validation skipped (%s) and push aborted. The new "
             "entry is at %s; install Node.js, then run "
