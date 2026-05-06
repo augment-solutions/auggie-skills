@@ -159,9 +159,12 @@ python3 scripts/generate_wiki.py \
 What happens:
 
 1. `git clone --depth=1 --branch <branch> $DEEP_WIKIS_GIT_REPO` into a
-   temp directory. If `GITHUB_TOKEN` (or `GH_TOKEN`) is set, it is
-   passed via an `Authorization: Bearer …` header for that single
-   invocation — never written to `.git/config` or logs.
+   temp directory. The script auto-detects which credential source to
+   use and logs the chosen mode at the start of the run (see
+   "Authentication" below). When the initial clone fails with a
+   401/403/404 **and** a token was used, the script retries once
+   anonymously so a public host repo still works when the supplied
+   token doesn't cover it.
 2. `wiki.mdx` + `repo_metadata.json` are converted into an Astro
    content-collection entry at
    `src/content/wikis/<slug>/index.mdx`. Any existing directory for
@@ -198,13 +201,32 @@ To bootstrap your own:
 
 ### Authentication
 
-| Environment            | How to authenticate                                  |
-| ---------------------- | ---------------------------------------------------- |
-| Local (HTTPS clone)    | Set `GITHUB_TOKEN` (PAT with `contents: write`), or rely on git's credential helper / OS keychain |
-| Local (SSH clone)      | Use `git@github.com:<org>/deep-wikis.git` and the SSH key already configured for git |
-| Poseidon / CI sandbox  | `GITHUB_TOKEN` is typically already exported; just set `DEEP_WIKIS_GIT_REPO` |
+`publish_git.py` picks one of three modes at the start of every run
+and logs the choice as `Auth: <mode>`:
+
+| Mode                          | When                                                         | Notes |
+| ----------------------------- | ------------------------------------------------------------ | ----- |
+| `git-credential-helper`       | A git credential helper is configured for the host (Cosmos sandbox, `gh auth login`) | Preferred. Helper-managed tokens stay fresh and survive 401 via `erase`→refresh. Env vars are intentionally ignored to avoid pinning a stale token. |
+| `http-authorization-header`   | No helper configured, but `GITHUB_TOKEN` (or `GH_TOKEN`) is set | Fallback. Token injected via `-c http.extraHeader=…` for that single invocation — never written to `.git/config` or logs. No auto-refresh; very long runs may need a re-publish if the env var expires. |
+| `anonymous`                   | No helper, no token                                          | Public-repo clone works; push and private-repo clone fail with an actionable error. |
+
+| Environment            | Typical mode                          | What to set                                              |
+| ---------------------- | ------------------------------------- | -------------------------------------------------------- |
+| Local (HTTPS clone)    | `git-credential-helper` (preferred)   | `gh auth login`, or set `GITHUB_TOKEN` (PAT with `contents: write`) for header-mode fallback |
+| Local (SSH clone)      | n/a — SSH key handles auth            | Use `git@github.com:<org>/deep-wikis.git` and a configured key |
+| Poseidon / Cosmos      | `git-credential-helper` (preferred)   | Just set `DEEP_WIKIS_GIT_REPO`. The sandbox installs the helper at boot and refreshes the installation token on demand. |
+| GitHub Actions         | `http-authorization-header`           | `GITHUB_TOKEN` is provided by the runner; just set `DEEP_WIKIS_GIT_REPO` |
 
 The skill never persists or echoes the token.
+
+#### Push failure classification
+
+Auth-class push failures are tagged with one of `auth-401`, `auth-403`,
+`auth-404`, or `auth-no-credential` and surfaced with a one-paragraph
+remediation hint. An agent reading the log can immediately tell
+whether the user needs to refresh a token, edit GitHub App
+permissions, add the host repo to the App's selected repositories, or
+configure a credential at all.
 
 ### Hosting multiple wikis on one site
 
@@ -322,7 +344,10 @@ in `scripts/generate_wiki.py`.
 | Mermaid diagram doesn't render in your CMS  | The CMS may need a remark/rehype plugin —       |
 |                                             | the MDX itself compiles fine                    |
 | `No host repo configured`                   | Pass `--wiki-repo …` or export `DEEP_WIKIS_GIT_REPO` |
-| `git push failed: Authentication failed`    | Set `GITHUB_TOKEN` (PAT with `contents: write`) for HTTPS, or use the SSH form of the URL with a configured key |
+| `git push failed (auth-401): …`             | Credential rejected as invalid/expired. On Cosmos: check the GitHub App is installed on the host repo's owner. Locally: `gh auth refresh` or regenerate `$GITHUB_TOKEN` |
+| `git push failed (auth-403): …`             | Credential authenticated but lacks write access. GitHub App: edit permissions to include `Contents: Read & write`. PAT: needs `repo` scope (classic) or `Contents: write` (fine-grained) |
+| `git push failed (auth-404): …`             | Repo not in credential's scope. GitHub App: add the host repo to the App's selected repositories on github.com |
+| `git push failed (auth-no-credential): …`   | No credential available. Configure a credential helper (`gh auth login`) or set `GITHUB_TOKEN` |
 | Push rejected, retry message in logs        | Concurrent publish from another session — the script rebases and retries up to 3 times automatically; if it still fails, rerun |
 | Wiki appears at the wrong URL               | Override the slug with `--wiki-slug <slug>` (default is `<owner>-<repo>`) |
 | Want to preview before pushing              | Use `--no-push --keep-wiki-work-dir --wiki-work-dir /tmp/deep-wikis-clone` and inspect the commit |

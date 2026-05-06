@@ -183,6 +183,127 @@ class TestResolveToken:
         monkeypatch.delenv("GH_TOKEN", raising=False)
         assert pg._resolve_token() is None
 
+    def test_helper_present_for_url_returns_none(self, monkeypatch):
+        # When git already has a credential helper for the host, the
+        # script must not fall back to the env-var token: doing so would
+        # bypass the helper and pin a stale value.
+        monkeypatch.setenv("GITHUB_TOKEN", "stale-token")
+        monkeypatch.setattr(
+            pg, "_credential_helper_configured_for", lambda url: True
+        )
+        assert pg._resolve_token("https://github.com/x/y.git") is None
+
+    def test_helper_absent_for_url_falls_back_to_env(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "fresh-token")
+        monkeypatch.setattr(
+            pg, "_credential_helper_configured_for", lambda url: False
+        )
+        assert pg._resolve_token("https://github.com/x/y.git") == "fresh-token"
+
+
+class TestCredentialHelperConfiguredFor:
+    """``_credential_helper_configured_for`` shells out to ``git config
+    --get-urlmatch credential.helper <url>`` and returns ``True`` only
+    when git printed a non-empty helper line."""
+
+    def test_returns_true_when_git_prints_helper(self, monkeypatch):
+        def fake_run(cmd, **kw):
+            assert cmd[:4] == ["git", "config", "--get-urlmatch", "credential.helper"]
+            return subprocess.CompletedProcess(cmd, 0, "store\n", "")
+
+        monkeypatch.setattr(pg.subprocess, "run", fake_run)
+        assert pg._credential_helper_configured_for("https://github.com/x/y.git") is True
+
+    def test_returns_false_when_git_exits_nonzero(self, monkeypatch):
+        def fake_run(cmd, **kw):
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+
+        monkeypatch.setattr(pg.subprocess, "run", fake_run)
+        assert pg._credential_helper_configured_for("https://github.com/x/y.git") is False
+
+    def test_returns_false_on_empty_stdout(self, monkeypatch):
+        def fake_run(cmd, **kw):
+            return subprocess.CompletedProcess(cmd, 0, "   \n", "")
+
+        monkeypatch.setattr(pg.subprocess, "run", fake_run)
+        assert pg._credential_helper_configured_for("https://github.com/x/y.git") is False
+
+    def test_returns_false_when_git_unavailable(self, monkeypatch):
+        def boom(cmd, **kw):
+            raise OSError("git not found")
+
+        monkeypatch.setattr(pg.subprocess, "run", boom)
+        assert pg._credential_helper_configured_for("https://github.com/x/y.git") is False
+
+    def test_returns_false_on_timeout(self, monkeypatch):
+        def slow(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, 5)
+
+        monkeypatch.setattr(pg.subprocess, "run", slow)
+        assert pg._credential_helper_configured_for("https://github.com/x/y.git") is False
+
+
+class TestResolveAuth:
+    """Three explicit modes; the chosen mode drives both behaviour and
+    diagnostic logging."""
+
+    def test_helper_mode_when_helper_present(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghs_xxx")
+        monkeypatch.setattr(
+            pg, "_credential_helper_configured_for", lambda url: True
+        )
+        token, mode = pg.resolve_auth("https://github.com/x/y.git")
+        assert token is None
+        assert mode == pg.AUTH_HELPER
+
+    def test_header_mode_when_no_helper_but_env_token(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_xxx")
+        monkeypatch.setattr(
+            pg, "_credential_helper_configured_for", lambda url: False
+        )
+        token, mode = pg.resolve_auth("https://github.com/x/y.git")
+        assert token == "ghp_xxx"
+        assert mode == pg.AUTH_HEADER
+
+    def test_anonymous_mode_when_nothing_available(self, monkeypatch):
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.setattr(
+            pg, "_credential_helper_configured_for", lambda url: False
+        )
+        token, mode = pg.resolve_auth("https://github.com/x/y.git")
+        assert token is None
+        assert mode == pg.AUTH_ANONYMOUS
+
+
+class TestClassifyGitError:
+    """Maps known GitHub error fingerprints to actionable hints. Returns
+    ``(None, None)`` for unrecognised output so the caller falls back to
+    the raw stderr."""
+
+    @pytest.mark.parametrize(
+        "stderr,expected_category",
+        [
+            ("remote: invalid credentials\n", "auth-401"),
+            ("fatal: could not read Username for 'https://github.com'", "auth-no-credential"),
+            ("fatal: could not read Username: terminal prompts disabled", "auth-no-credential"),
+            ("remote: Permission denied to user/x.\n", "auth-403"),
+            ("remote: Repository not found.\nfatal: repository 'x' not found", "auth-404"),
+            ("error: 403 Forbidden\n", "auth-403"),
+            ("HTTP 401 returned\n", "auth-401"),
+        ],
+    )
+    def test_known_signals_classified(self, stderr, expected_category):
+        category, hint = pg._classify_git_error(stderr)
+        assert category == expected_category
+        assert hint and len(hint) > 20  # meaningful, not just a stub
+
+    def test_unknown_signal_returns_none(self):
+        assert pg._classify_git_error("network unreachable") == (None, None)
+
+    def test_empty_stderr_returns_none(self):
+        assert pg._classify_git_error("") == (None, None)
+
 
 # ---------------------------------------------------------------------------
 # write_entry — atomic replacement
@@ -542,6 +663,70 @@ class TestCloneHostRepo:
         with pytest.raises(pg.PublishError, match="not a directory"):
             pg.clone_host_repo("https://x/y.git", "main", work_dir, token=None)
 
+    def test_anonymous_fallback_succeeds_for_public_repo(self, tmp_path, monkeypatch):
+        """When a token is supplied but yields 401/403/404, the script
+        retries anonymously for the (common) case of a public host repo
+        the token simply doesn't cover."""
+        work_dir = tmp_path / "deep-wikis"
+        attempts: list[dict[str, Any]] = []
+
+        def fake_run(cmd, **kwargs):
+            saw_header = any(
+                isinstance(a, str) and a.startswith("http.extraHeader=")
+                for a in cmd
+            )
+            attempts.append({"cmd": list(cmd), "with_header": saw_header})
+            if saw_header:
+                # First attempt: server says no.
+                return subprocess.CompletedProcess(
+                    cmd, 1, "", "remote: invalid credentials\nfatal: 401\n"
+                )
+            # Anonymous retry: succeeds. Materialize work_dir so
+            # subsequent steps would find it.
+            work_dir.mkdir(parents=True, exist_ok=True)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(pg, "_run", fake_run)
+        pg.clone_host_repo("https://x/y.git", "main", work_dir, token="bad")
+
+        assert len(attempts) == 2
+        assert attempts[0]["with_header"] is True
+        assert attempts[1]["with_header"] is False
+
+    def test_no_anonymous_fallback_when_no_token(self, tmp_path, monkeypatch):
+        """Without a token the failure is surfaced directly — no point
+        in retrying the same anonymous call."""
+        work_dir = tmp_path / "deep-wikis"
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, 1, "", "remote: invalid credentials\n"
+            )
+
+        monkeypatch.setattr(pg, "_run", fake_run)
+        with pytest.raises(pg.PublishError, match="git clone failed"):
+            pg.clone_host_repo("https://x/y.git", "main", work_dir, token=None)
+
+    def test_non_auth_failure_is_not_retried(self, tmp_path, monkeypatch):
+        """Network/branch-missing errors won't be cured by dropping
+        credentials, so the script must not waste an anonymous retry."""
+        work_dir = tmp_path / "deep-wikis"
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(
+                cmd, 128, "", "fatal: unable to access 'https://x/y.git/': "
+                "Could not resolve host: x\n",
+            )
+
+        monkeypatch.setattr(pg, "_run", fake_run)
+        with pytest.raises(pg.PublishError, match="git clone failed"):
+            pg.clone_host_repo("https://x/y.git", "main", work_dir, token="t")
+
+        # Exactly one attempt — no anonymous retry on non-auth errors.
+        assert len(calls) == 1
+
 
 # ---------------------------------------------------------------------------
 # write_entry — symlink escape guard
@@ -898,6 +1083,42 @@ class TestPushRetryClassification:
         # Each failed push is followed by a pull --rebase before retrying.
         assert sum(1 for c in calls if "push" in c) == pg.PUSH_RETRIES
         assert sum(1 for c in calls if "pull" in c and "--rebase" in c) == pg.PUSH_RETRIES
+
+    def test_invalid_credentials_raises_with_actionable_hint(
+        self, tmp_path, monkeypatch
+    ):
+        """A 401 from the remote must surface the classifier hint so the
+        user can tell whether to refresh the token or fix App scope —
+        not just the raw 'remote: invalid credentials' line that started
+        this whole investigation."""
+        fake_run, calls = self._make_runner(
+            "remote: invalid credentials\n"
+            "fatal: Authentication failed for 'https://github.com/x/y.git/'\n"
+        )
+        monkeypatch.setattr(pg, "_run", fake_run)
+        with pytest.raises(pg.PublishError, match="auth-401"):
+            pg.commit_and_push(
+                self._setup_committed_repo(tmp_path),
+                slug="abc", branch="main", push=True, token=None,
+                author_name="x", author_email="x@y",
+            )
+        # Single attempt — 401 is not retryable via rebase.
+        assert sum(1 for c in calls if "push" in c) == 1
+        assert not any("pull" in c for c in calls)
+
+    def test_permission_denied_surfaces_403_hint(self, tmp_path, monkeypatch):
+        fake_run, _ = self._make_runner(
+            "remote: Permission to org/repo.git denied to user.\n"
+            "fatal: unable to access 'https://github.com/x/y.git/': "
+            "The requested URL returned error: 403\n"
+        )
+        monkeypatch.setattr(pg, "_run", fake_run)
+        with pytest.raises(pg.PublishError, match="auth-403"):
+            pg.commit_and_push(
+                self._setup_committed_repo(tmp_path),
+                slug="abc", branch="main", push=True, token=None,
+                author_name="x", author_email="x@y",
+            )
 
 
 # ---------------------------------------------------------------------------
