@@ -363,17 +363,313 @@ def _git_base(token: str | None) -> list[str]:
     return cmd
 
 
-def _resolve_token() -> str | None:
-    """Return a token from the standard env vars, if any.
+def _credential_helper_configured_for(url: str) -> bool:
+    """Return ``True`` when git already has a credential helper for ``url``.
 
-    Order: ``GITHUB_TOKEN`` (Poseidon sandbox + GitHub Actions), then
-    ``GH_TOKEN`` (gh CLI). Empty values are treated as unset.
+    Uses ``git config --get-urlmatch credential.helper <url>`` so we honour
+    per-host overrides (e.g. ``credential.https://github.com.helper``) as
+    well as the global setting. The Poseidon/Cosmos sandbox installs such a
+    helper at boot for ``https://github.com`` so installation tokens stay
+    fresh across long agent sessions; ``gh auth login`` does the same on
+    developer workstations.
+
+    When this returns ``True``, callers MUST avoid injecting
+    ``http.extraHeader``: the header would override the helper, pin a
+    stale token, and break the helper's ``erase``→refresh→retry recovery
+    loop on 401. When ``False`` (e.g. plain GitHub Actions, vanilla CI
+    runners), callers fall back to env-var-based header injection.
+
+    Non-HTTP(S) URLs (``ssh://``, ``git@host:org/repo.git``, ``file://``)
+    short-circuit to ``False``: ``--get-urlmatch`` is defined for HTTP(S)
+    only and SSH transports authenticate via the ssh-agent / key, not
+    via git credential helpers, so there's no helper to defer to.
     """
+    if not url.lower().startswith(("http://", "https://")):
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "config", "--get-urlmatch", "credential.helper", url],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0 and bool(proc.stdout.strip())
+
+
+# Auth-mode constants returned by ``resolve_auth``.  Kept as plain strings
+# so they can appear directly in log output and ``PublishError`` messages
+# without any extra translation step.
+AUTH_HELPER = "git-credential-helper"
+AUTH_HEADER = "http-authorization-header"
+AUTH_ANONYMOUS = "anonymous"
+# SSH transports (``git@host:org/repo.git``, ``ssh://...``) authenticate
+# via the ssh-agent / private key, not via a git credential helper or
+# HTTP Authorization header.  Track this separately so the
+# ``Auth: ...`` log line accurately reflects the mechanism in use and
+# diagnostics don't tell the user "anonymous - push will fail" when
+# their SSH key would have worked.
+AUTH_SSH = "ssh-key"
+
+
+def _is_ssh_repo_url(url: str) -> bool:
+    """``True`` for SSH transport URLs accepted by git.
+
+    Covers both the explicit ``ssh://`` / ``git+ssh://`` schemes and
+    the scp-like form ``[user@]host:path``.  The user prefix is
+    optional - ``github.com:org/repo.git`` and
+    ``gh-work:org/repo.git`` (a host alias from ``~/.ssh/config``) are
+    both valid.
+
+    Negative cases handled:
+      * Explicit URL schemes that aren't SSH (``http://``, ``https://``,
+        ``file://``, ``git://``).
+      * Filesystem paths (``/tmp/...``, ``./repo``, ``~/repo``).
+      * Windows drive letters (``C:\\Users\\...`` or ``C:/Users/...``)
+        - the part before ``:`` would be a single letter, which is
+        rejected to avoid false-matching as ``host:path``.
+      * Email-like noise without a ``:`` (e.g. ``noreply@github.com``).
+    """
+    stripped = url.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    if lowered.startswith(("ssh://", "git+ssh://")):
+        return True
+    if lowered.startswith(("http://", "https://", "file://", "git://")):
+        return False
+    if lowered.startswith(("/", "./", "../", "~")):
+        return False
+    # Bracketed IPv6 scp-like form: ``[user@][::1]:path`` (the brackets
+    # disambiguate the host's internal ``:`` from the host/path
+    # separator).  Detect this before the generic single-``:`` parse so
+    # an IPv6 literal isn't truncated at its first colon.
+    bracket_open = stripped.find("[")
+    bracket_close_sep = stripped.find("]:")  # ``]:`` is the host/path separator
+    if (
+        bracket_open != -1
+        and bracket_close_sep > bracket_open
+    ):
+        # Any ``/`` must appear after the ``]:`` separator (i.e. inside
+        # the path component).  A ``/`` before ``]`` would mean the
+        # bracket-pair is not the host envelope.
+        slash = stripped.find("/")
+        if slash == -1 or slash > bracket_close_sep:
+            v6 = stripped[bracket_open + 1 : bracket_close_sep]
+            # Anything between ``[`` and ``]`` must look like an IPv6
+            # literal (hex digits and ``:``); reject obvious non-IPv6
+            # garbage so we don't accidentally widen the match.
+            if v6 and all(c in "0123456789abcdefABCDEF:" for c in v6):
+                return True
+    # scp-like: ``[user@]host:path``.  Require a ``:`` that appears
+    # before any ``/`` (otherwise it's a path with a ``:`` somewhere
+    # in it, not a host:path separator).
+    colon = stripped.find(":")
+    if colon <= 0:
+        return False
+    slash = stripped.find("/")
+    if slash != -1 and slash < colon:
+        return False
+    host_part = stripped[:colon]
+    # Strip optional user prefix.
+    if "@" in host_part:
+        host_part = host_part.split("@", 1)[1]
+        if not host_part:
+            return False
+    # Single-character host = Windows drive letter (``C:``).  A real
+    # SSH host alias is at least 2 characters long in practice.
+    if len(host_part) <= 1:
+        return False
+    # Reject any host that contains characters not allowed in DNS
+    # names or SSH config aliases (letters, digits, ``-``, ``.``,
+    # ``_``).  Anything else is almost certainly not a hostname.
+    return all(c.isalnum() or c in "-._" for c in host_part)
+
+
+def _resolve_token(repo_url: str | None = None) -> str | None:
+    """Return a token from env vars, or ``None`` to defer to git.
+
+    Order:
+
+    1. If ``repo_url`` is given and a credential helper is configured for
+       its host, return ``None`` so the caller does not inject an
+       ``Authorization`` header. The helper supplies (and on Cosmos,
+       transparently refreshes) the credential on each git invocation.
+    2. Otherwise fall back to ``GITHUB_TOKEN`` (Poseidon sandbox +
+       GitHub Actions), then ``GH_TOKEN`` (gh CLI). Empty values are
+       treated as unset.
+    """
+    if repo_url and _credential_helper_configured_for(repo_url):
+        return None
     for name in ("GITHUB_TOKEN", "GH_TOKEN"):
         val = os.environ.get(name, "").strip()
         if val:
             return val
     return None
+
+
+def resolve_auth(repo_url: str) -> tuple[str | None, str]:
+    """Return ``(token, mode)`` for ``repo_url``.
+
+    ``mode`` is one of :data:`AUTH_HELPER`, :data:`AUTH_HEADER`,
+    :data:`AUTH_SSH`, or :data:`AUTH_ANONYMOUS` and is suitable for
+    direct logging. The distinction matters for diagnostics: a 401
+    under ``AUTH_HELPER`` means the helper handed git a token the
+    remote rejected (App permissions / installation scope problem),
+    whereas a 401 under ``AUTH_HEADER`` typically means the env-var
+    token is stale or insufficiently scoped, ``AUTH_SSH`` defers
+    entirely to ssh-agent / private key (no token to inject), and
+    ``AUTH_ANONYMOUS`` against a private repo simply needs credentials.
+    """
+    if _is_ssh_repo_url(repo_url):
+        return None, AUTH_SSH
+    if _credential_helper_configured_for(repo_url):
+        return None, AUTH_HELPER
+    token = _resolve_token(None)  # explicit: skip helper check, env-var only
+    if token:
+        return token, AUTH_HEADER
+    return None, AUTH_ANONYMOUS
+
+
+# Reusable remediation hints for the bare-status-code fingerprints below.
+# Defined once so a wording change to (say) the 403 message doesn't
+# require touching every variant fingerprint.
+_HINT_403 = (
+    "Remote returned HTTP 403 (forbidden). The credential is "
+    "recognised but does not have permission for this operation. "
+    "For clone: check repo read access; for push: check write "
+    "access. SSO or IP allow-list enforcement can also produce a "
+    "403 - authorize the credential for the org or run from an "
+    "allow-listed network."
+)
+_HINT_401 = (
+    "Remote returned HTTP 401 (unauthorized). The credential was "
+    "supplied but the server rejected it as invalid or expired. "
+    "If running on Cosmos: check that the GitHub App is installed "
+    "on the host repo's owner and the installation has not been "
+    "revoked - the helper should refresh on the next attempt. "
+    "If running locally: refresh the token (`gh auth refresh` or "
+    "regenerate $GITHUB_TOKEN)."
+)
+_HINT_404 = (
+    "Remote returned HTTP 404 (not found). The credential may be "
+    "valid but the repo is not in its scope. On a GitHub App "
+    "installation: add the host repo to the App's selected "
+    "repositories. Otherwise verify the repo URL points at a repo "
+    "the credential can see."
+)
+
+
+# Substring fingerprints of common GitHub-side auth/permission failures.
+# Lowercase-compared.  Order matters: the first match wins so the more
+# specific signal (e.g. "permission denied to") is checked before the
+# generic "status 403".
+_AUTH_FAILURE_SIGNALS: tuple[tuple[str, str, str], ...] = (
+    (
+        "invalid credentials",
+        "auth-401",
+        "GitHub rejected the credential as invalid or expired (HTTP 401). "
+        "If running on Cosmos: check that the GitHub App is installed on "
+        "the host repo's owner and the installation has not been revoked. "
+        "If running locally: refresh the token (`gh auth refresh` or "
+        "regenerate $GITHUB_TOKEN).",
+    ),
+    (
+        # Generic git form when a credential is supplied but rejected and
+        # the remote did not echo the words "invalid credentials" or a
+        # bare HTTP status. Frequent on https push to GitHub when the App
+        # installation has been removed or the PAT was revoked.
+        "authentication failed for",
+        "auth-401",
+        "Git could not authenticate to the remote (HTTP 401). The "
+        "credential is being supplied but the server rejected it. "
+        "If running on Cosmos: the GitHub App installation may have "
+        "been removed or its token may have expired - the helper "
+        "should refresh on the next attempt. If running locally: "
+        "refresh the token (`gh auth refresh` or regenerate "
+        "$GITHUB_TOKEN).",
+    ),
+    (
+        "could not read username",
+        "auth-no-credential",
+        "Git asked for credentials and got none. Set $GITHUB_TOKEN or "
+        "configure a credential helper (`gh auth login`).",
+    ),
+    (
+        "terminal prompts disabled",
+        "auth-no-credential",
+        "Git tried to interactively prompt for credentials but no TTY is "
+        "available. Set $GITHUB_TOKEN or configure a credential helper.",
+    ),
+    (
+        "permission denied to",
+        "auth-403",
+        "The credential authenticated but lacks the required repo "
+        "access (HTTP 403). For a clone this typically means no read "
+        "access; for a push, no write access. On a GitHub App "
+        "installation: edit the App's permissions to include "
+        "`Contents: Read & write` (or `Read-only` for clone-only). "
+        "On a PAT: ensure the token scope includes `repo` (classic) "
+        "or `Contents: write` (fine-grained). Org-enforced SSO or "
+        "an IP allow-list can also surface as 403 - authorize the "
+        "credential for the org or run from an allow-listed network.",
+    ),
+    (
+        # GitHub push-side wording when the credential authenticated
+        # but lacks write scope on the target repo. Distinct enough
+        # from "permission denied to <user>" that we keep it explicit
+        # rather than relying on the bare "403" fingerprints.
+        "write access to repository not granted",
+        "auth-403",
+        "GitHub accepted the credential but it does not have write "
+        "access to this repo (HTTP 403). On a GitHub App installation: "
+        "add `Contents: Read & write` to the App's permissions and "
+        "ensure the host repo is in its selected repositories. On a "
+        "PAT: use `repo` (classic) or `Contents: write` (fine-grained).",
+    ),
+    (
+        "repository not found",
+        "auth-404",
+        "The remote returned 'repository not found' (HTTP 404). The "
+        "credential is valid but the repo is not in its scope. On a "
+        "GitHub App installation: add the host repo to the App's "
+        "selected repositories on github.com. Otherwise verify "
+        "$DEEP_WIKIS_GIT_REPO points at a repo the credential can see.",
+    ),
+    # The bare-status-code fingerprints below are intentionally narrow
+    # ("status 4xx", "http 4xx", "error: 4xx", "code 4xx") so an unrelated
+    # "403" appearing in a path or filename can't false-trigger the
+    # classifier. Git/curl emit one of these forms when surfacing the
+    # actual HTTP status.
+    ("status 403", "auth-403", _HINT_403),
+    ("http 403", "auth-403", _HINT_403),
+    ("error: 403", "auth-403", _HINT_403),
+    ("code 403", "auth-403", _HINT_403),
+    ("status 401", "auth-401", _HINT_401),
+    ("http 401", "auth-401", _HINT_401),
+    ("error: 401", "auth-401", _HINT_401),
+    ("code 401", "auth-401", _HINT_401),
+    ("status 404", "auth-404", _HINT_404),
+    ("http 404", "auth-404", _HINT_404),
+    ("error: 404", "auth-404", _HINT_404),
+    ("code 404", "auth-404", _HINT_404),
+)
+
+
+def _classify_git_error(stderr: str) -> tuple[str | None, str | None]:
+    """Map a git error blob to ``(category, hint)`` or ``(None, None)``.
+
+    ``category`` is a short tag (e.g. ``auth-401``) suitable for log
+    correlation; ``hint`` is a one-paragraph remediation message safe to
+    surface to the user.  Returns ``(None, None)`` when no known signal
+    matches so the caller can fall back to the raw git output.
+    """
+    if not stderr:
+        return None, None
+    haystack = stderr.lower()
+    for needle, category, hint in _AUTH_FAILURE_SIGNALS:
+        if needle in haystack:
+            return category, hint
+    return None, None
 
 
 def _refresh_existing_clone(
@@ -458,16 +754,84 @@ def clone_host_repo(
             )
         # Empty directory — git clone refuses to clone into it, so remove first.
         work_dir.rmdir()
-    cmd = _git_base(token) + [
-        "clone",
-        "--depth=1",
-        "--branch",
-        branch,
-        repo_url,
-        str(work_dir),
-    ]
-    log.info("Cloning %s (branch=%s) -> %s", repo_url, branch, work_dir)
-    _run(cmd, capture=True, timeout=CLONE_TIMEOUT)
+    def _build_clone_cmd(use_token: str | None) -> list[str]:
+        return _git_base(use_token) + [
+            "clone",
+            "--depth=1",
+            "--branch",
+            branch,
+            repo_url,
+            str(work_dir),
+        ]
+
+    # ``repo_url`` typically has no userinfo but a caller could pass
+    # ``https://user:token@host/...``; redact defensively so the token
+    # never lands in logs even if the configuration is unusual.
+    log.info("Cloning %s (branch=%s) -> %s", _redact(repo_url), branch, work_dir)
+    proc = _run(
+        _build_clone_cmd(token),
+        capture=True,
+        check=False,
+        timeout=CLONE_TIMEOUT,
+    )
+    if proc.returncode == 0:
+        return
+
+    err = _redact((proc.stderr or "") + (proc.stdout or "")).strip()
+    category, hint = _classify_git_error(err)
+
+    # Anonymous fallback: when we tried with an injected header and got
+    # rejected with an auth-class signal, the host repo might simply be
+    # public and the supplied token might not cover it (e.g. a Cosmos
+    # GitHub App installation token bound to the *source* repo's owner
+    # being used to clone a host repo in a different org).  A retry with
+    # no Authorization header lets git fall through to anonymous HTTPS,
+    # which is the same thing a logged-out browser would do for a
+    # public repo.  Only attempt this when (a) we actually used a
+    # token, and (b) the failure was auth-class — non-auth failures
+    # (network, repo-not-found-with-no-token, branch missing) won't
+    # be cured by removing credentials.
+    if token and category in ("auth-401", "auth-403", "auth-404"):
+        log.warning(
+            "Initial clone of %s failed (%s). Retrying anonymously in "
+            "case the host repo is public and the supplied token does "
+            "not cover it.",
+            _redact(repo_url),
+            category,
+        )
+        # Wipe any partial directory git left behind so the retry sees
+        # a clean slate (git clone refuses to clone into a non-empty
+        # dir).
+        if work_dir.exists() and work_dir.is_dir():
+            shutil.rmtree(work_dir, ignore_errors=True)
+        retry = _run(
+            _build_clone_cmd(None),
+            capture=True,
+            check=False,
+            timeout=CLONE_TIMEOUT,
+        )
+        if retry.returncode == 0:
+            log.info(
+                "Anonymous clone of %s succeeded. Note: push will still "
+                "require valid credentials.",
+                _redact(repo_url),
+            )
+            return
+        retry_err = _redact((retry.stderr or "") + (retry.stdout or "")).strip()
+        # Surface both attempts so the operator can tell whether the
+        # fallback actually changed anything.
+        raise PublishError(
+            f"git clone failed for {_redact(repo_url)}: {hint or err}\n"
+            f"  initial (with token): {err}\n"
+            f"  anonymous retry:      {retry_err}"
+        )
+
+    if hint:
+        raise PublishError(
+            f"git clone failed for {_redact(repo_url)} ({category}): "
+            f"{hint}\n  git output: {err}"
+        )
+    raise PublishError(f"git clone failed for {_redact(repo_url)}: {err}")
 
 
 def write_entry(
@@ -801,6 +1165,13 @@ def commit_and_push(
     last_err: PublishError | None = None
     for attempt in range(1, PUSH_RETRIES + 1):
         cmd = _git_base(token) + ["push", "origin", branch]
+        log.info(
+            "Pushing %s to origin/%s [attempt %d/%d]",
+            sha[:8] if sha else "?",
+            branch,
+            attempt,
+            PUSH_RETRIES,
+        )
         proc = _run(cmd, cwd=work_dir, env=env, check=False, capture=True, timeout=PUSH_TIMEOUT)
         if proc.returncode == 0:
             log.info("Pushed %s to origin/%s", sha[:8] if sha else "?", branch)
@@ -829,6 +1200,22 @@ def commit_and_push(
             sha = _head_sha()
             last_err = PublishError(err.strip())
             continue
+        # Non-recoverable failure: classify so the user sees a hint
+        # instead of just the raw "remote: invalid credentials" line.
+        category, hint = _classify_git_error(err)
+        if category and hint:
+            log.error("Push failed (%s): %s", category, hint)
+            raise PublishError(
+                f"git push failed ({category}): {hint}\n  git output: {err.strip()}"
+            )
+        if "protected branch" in err.lower() or "pre-receive hook" in err.lower():
+            raise PublishError(
+                "git push failed: remote rejected the update via a "
+                "branch-protection rule or pre-receive hook. Verify the "
+                "branch is push-eligible for this credential, or "
+                "configure the host repo to allow this committer.\n"
+                f"  git output: {err.strip()}"
+            )
         raise PublishError(f"git push failed: {err.strip()}")
     raise PublishError(
         f"git push failed after {PUSH_RETRIES} retries: {last_err}"
@@ -893,11 +1280,53 @@ def publish(
     )
     log.info("Slug: %s", final_slug)
 
-    token = _resolve_token()
-    if token:
-        log.info("Auth: HTTP Authorization header (from env)")
+    token, auth_mode = resolve_auth(repo_url)
+    # Four explicit modes so a downstream agent (or human) can read the
+    # log and immediately know which knob to turn if a 401/403 follows:
+    #   - helper:    git's credential helper (Cosmos sandbox, ``gh auth login``)
+    #                supplies the credential. Stays fresh; survives token
+    #                rotation; recovers from 401 via erase→refresh.
+    #   - header:    we inject ``Authorization: Bearer $GITHUB_TOKEN``.
+    #                Pinned for the run; if the env-var token is stale,
+    #                no automatic refresh.
+    #   - ssh:       ssh-agent / private key. No token to manage; failures
+    #                point at the key, agent, or remote `authorized_keys`.
+    #   - anonymous: no credential at all. Works for public-repo clones,
+    #                fails for push or private-repo clone.
+    # Each branch starts with the literal ``Auth: <AUTH_*>`` token so
+    # downstream agents and humans can grep / regex-match the chosen
+    # mode.  The descriptive sentence after the dash is for humans
+    # only and may be reworded freely; the token must not change.
+    if auth_mode == AUTH_HELPER:
+        log.info(
+            "Auth: %s - deferring to git credential helper for %s "
+            "(env GITHUB_TOKEN/GH_TOKEN ignored to keep helper-managed "
+            "token fresh).",
+            AUTH_HELPER, _redact(repo_url),
+        )
+    elif auth_mode == AUTH_HEADER:
+        log.info(
+            "Auth: %s - HTTP Authorization header from env "
+            "(no credential helper configured for this host; token will "
+            "not be auto-refreshed for this run).",
+            AUTH_HEADER,
+        )
+    elif auth_mode == AUTH_SSH:
+        log.info(
+            "Auth: %s - ssh-agent / private key supplies the "
+            "credential (transport is %s); $GITHUB_TOKEN is ignored. A "
+            "permission failure here points at the key, the agent, or "
+            "the remote `authorized_keys` / deploy-key configuration.",
+            AUTH_SSH,
+            "ssh://" if repo_url.lower().startswith(("ssh://", "git+ssh://")) else "scp-like",
+        )
     else:
-        log.info("Auth: relying on git's default credentials")
+        log.info(
+            "Auth: %s - no credential helper, no GITHUB_TOKEN/"
+            "GH_TOKEN. Push and private-repo clone will fail; only "
+            "public-repo clone works.",
+            AUTH_ANONYMOUS,
+        )
 
     cleanup_dir: Path | None = None
     try:
