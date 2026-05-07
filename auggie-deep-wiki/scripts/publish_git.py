@@ -414,25 +414,54 @@ AUTH_SSH = "ssh-key"
 def _is_ssh_repo_url(url: str) -> bool:
     """``True`` for SSH transport URLs accepted by git.
 
-    Covers both the explicit ``ssh://`` scheme and the scp-like form
-    ``user@host:path`` (e.g. ``git@github.com:org/repo.git``).
-    Anything HTTP(S) or with no host prefix is treated as non-SSH.
+    Covers both the explicit ``ssh://`` / ``git+ssh://`` schemes and
+    the scp-like form ``[user@]host:path``.  The user prefix is
+    optional - ``github.com:org/repo.git`` and
+    ``gh-work:org/repo.git`` (a host alias from ``~/.ssh/config``) are
+    both valid.
+
+    Negative cases handled:
+      * Explicit URL schemes that aren't SSH (``http://``, ``https://``,
+        ``file://``, ``git://``).
+      * Filesystem paths (``/tmp/...``, ``./repo``, ``~/repo``).
+      * Windows drive letters (``C:\\Users\\...`` or ``C:/Users/...``)
+        - the part before ``:`` would be a single letter, which is
+        rejected to avoid false-matching as ``host:path``.
+      * Email-like noise without a ``:`` (e.g. ``noreply@github.com``).
     """
-    lowered = url.strip().lower()
+    stripped = url.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
     if lowered.startswith(("ssh://", "git+ssh://")):
         return True
-    if lowered.startswith(("http://", "https://", "file://", "/")):
+    if lowered.startswith(("http://", "https://", "file://", "git://")):
         return False
-    # scp-like: ``user@host:path``.  Require a ``:`` after the ``@`` and
-    # before any ``/`` to avoid false-matching e.g. an email-style noise
-    # string.
-    at = url.find("@")
-    if at <= 0:
+    if lowered.startswith(("/", "./", "../", "~")):
         return False
-    rest = url[at + 1 :]
-    colon = rest.find(":")
-    slash = rest.find("/")
-    return colon != -1 and (slash == -1 or colon < slash)
+    # scp-like: ``[user@]host:path``.  Require a ``:`` that appears
+    # before any ``/`` (otherwise it's a path with a ``:`` somewhere
+    # in it, not a host:path separator).
+    colon = stripped.find(":")
+    if colon <= 0:
+        return False
+    slash = stripped.find("/")
+    if slash != -1 and slash < colon:
+        return False
+    host_part = stripped[:colon]
+    # Strip optional user prefix.
+    if "@" in host_part:
+        host_part = host_part.split("@", 1)[1]
+        if not host_part:
+            return False
+    # Single-character host = Windows drive letter (``C:``).  A real
+    # SSH host alias is at least 2 characters long in practice.
+    if len(host_part) <= 1:
+        return False
+    # Reject any host that contains characters not allowed in DNS
+    # names or SSH config aliases (letters, digits, ``-``, ``.``,
+    # ``_``).  Anything else is almost certainly not a hostname.
+    return all(c.isalnum() or c in "-._" for c in host_part)
 
 
 def _resolve_token(repo_url: str | None = None) -> str | None:
@@ -1227,32 +1256,39 @@ def publish(
     #                point at the key, agent, or remote `authorized_keys`.
     #   - anonymous: no credential at all. Works for public-repo clones,
     #                fails for push or private-repo clone.
+    # Each branch starts with the literal ``Auth: <AUTH_*>`` token so
+    # downstream agents and humans can grep / regex-match the chosen
+    # mode.  The descriptive sentence after the dash is for humans
+    # only and may be reworded freely; the token must not change.
     if auth_mode == AUTH_HELPER:
         log.info(
-            "Auth: deferring to git credential helper for %s "
+            "Auth: %s - deferring to git credential helper for %s "
             "(env GITHUB_TOKEN/GH_TOKEN ignored to keep helper-managed "
             "token fresh).",
-            _redact(repo_url),
+            AUTH_HELPER, _redact(repo_url),
         )
     elif auth_mode == AUTH_HEADER:
         log.info(
-            "Auth: HTTP Authorization header from env "
+            "Auth: %s - HTTP Authorization header from env "
             "(no credential helper configured for this host; token will "
-            "not be auto-refreshed for this run)."
+            "not be auto-refreshed for this run).",
+            AUTH_HEADER,
         )
     elif auth_mode == AUTH_SSH:
         log.info(
-            "Auth: SSH key (transport is %s). ssh-agent / private key "
-            "supplies the credential; $GITHUB_TOKEN is ignored. A "
+            "Auth: %s - ssh-agent / private key supplies the "
+            "credential (transport is %s); $GITHUB_TOKEN is ignored. A "
             "permission failure here points at the key, the agent, or "
             "the remote `authorized_keys` / deploy-key configuration.",
+            AUTH_SSH,
             "ssh://" if repo_url.lower().startswith(("ssh://", "git+ssh://")) else "scp-like",
         )
     else:
         log.info(
-            "Auth: anonymous (no credential helper, no GITHUB_TOKEN/"
-            "GH_TOKEN). Push and private-repo clone will fail; only "
-            "public-repo clone works."
+            "Auth: %s - no credential helper, no GITHUB_TOKEN/"
+            "GH_TOKEN. Push and private-repo clone will fail; only "
+            "public-repo clone works.",
+            AUTH_ANONYMOUS,
         )
 
     cleanup_dir: Path | None = None

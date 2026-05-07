@@ -278,6 +278,12 @@ class TestIsSshRepoUrl:
             "ssh://git@github.com/org/repo.git",
             "git+ssh://git@github.com/org/repo.git",
             "user@host.example.com:path/to/repo.git",
+            # scp-like without an explicit user.  Valid when the user's
+            # ``~/.ssh/config`` sets ``User git`` for the host (or alias).
+            "github.com:org/repo.git",
+            "gh-work:org/repo.git",
+            # Surrounding whitespace must not change the verdict.
+            "  git@github.com:org/repo.git  ",
         ],
     )
     def test_ssh_forms_detected(self, url):
@@ -290,13 +296,39 @@ class TestIsSshRepoUrl:
             "http://example.com/repo.git",
             "file:///tmp/local-repo",
             "/tmp/local-repo",
+            "./relative/repo",
+            "../up/repo",
+            "~/repo",
+            # The git:// (anonymous git protocol) is HTTP-ish in spirit
+            # and must not be classified as SSH.
+            "git://github.com/org/repo.git",
+            # Windows drive paths must not be misread as ``host:path``.
+            "C:\\Users\\me\\repo",
+            "C:/Users/me/repo",
+            "D:\\repo",
             # email-like noise without a host:path colon must not be SSH.
             "noreply@github.com",
             "",
+            "   ",
+            # Path with a colon somewhere inside but no host prefix.
+            "/var/git/has:colon/repo",
         ],
     )
     def test_non_ssh_forms_rejected(self, url):
         assert pg._is_ssh_repo_url(url) is False
+
+
+class TestAuthModeConstants:
+    """``publish()`` formats the ``Auth: <AUTH_*>`` log line with these
+    literal tokens; downstream agents grep for them.  Renaming a
+    constant here is a breaking change for log-parsing consumers, so
+    pin the string values explicitly."""
+
+    def test_constant_string_values_are_stable(self):
+        assert pg.AUTH_HELPER == "git-credential-helper"
+        assert pg.AUTH_HEADER == "http-authorization-header"
+        assert pg.AUTH_SSH == "ssh-key"
+        assert pg.AUTH_ANONYMOUS == "anonymous"
 
 
 class TestResolveAuth:

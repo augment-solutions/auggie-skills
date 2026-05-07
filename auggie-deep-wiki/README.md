@@ -207,7 +207,19 @@ To bootstrap your own:
 ### Authentication
 
 `publish_git.py` picks one of four modes at the start of every run
-and logs the choice as `Auth: <mode>`:
+and logs the choice on a single line that begins with the literal
+token `Auth: <mode> -` (the dash is followed by a one-sentence,
+human-readable explanation). The `<mode>` token is one of
+`git-credential-helper`, `http-authorization-header`, `ssh-key`, or
+`anonymous`, and is stable across releases — agents and grep-based
+tooling can match on the token directly. Examples:
+
+```text
+Auth: git-credential-helper - deferring to git credential helper for https://github.com/... (env GITHUB_TOKEN/GH_TOKEN ignored to keep helper-managed token fresh).
+Auth: http-authorization-header - HTTP Authorization header from env (no credential helper configured for this host; token will not be auto-refreshed for this run).
+Auth: ssh-key - ssh-agent / private key supplies the credential (transport is scp-like); $GITHUB_TOKEN is ignored. A permission failure here points at the key, the agent, or the remote `authorized_keys` / deploy-key configuration.
+Auth: anonymous - no credential helper, no GITHUB_TOKEN/GH_TOKEN. Push and private-repo clone will fail; only public-repo clone works.
+```
 
 | Mode                          | When                                                         | Notes |
 | ----------------------------- | ------------------------------------------------------------ | ----- |
