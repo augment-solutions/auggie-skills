@@ -79,9 +79,10 @@ auggie \
   [--augment-session-json ~/.augment/.auggie.json]   # only when the file exists
 ```
 
-`AUGMENT_API_URL` is exported into the child env (default
-`https://staging-shard-0.api.augmentcode.com`). `AUGMENT_API_TOKEN`, if set
-in the parent env, is inherited automatically.
+`AUGMENT_API_URL` is exported into the child env when set; if empty (the
+default), `auggie` reads the `tenantURL` from the session file. Set this
+only when you need to override the tenant URL for a specific environment.
+`AUGMENT_API_TOKEN`, if set in the parent env, is inherited automatically.
 
 ## MDX rules enforced by `prompts/wiki_section.txt`
 

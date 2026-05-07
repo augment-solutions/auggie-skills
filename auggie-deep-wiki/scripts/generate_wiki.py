@@ -742,8 +742,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=os.environ.get("AUGMENT_API_URL", DEFAULT_API_URL),
         help=(
             "Augment API URL. Default: empty, in which case auggie reads the "
-            "tenantURL from the session file. Set to override (e.g. for "
-            "staging-shard-0.api.augmentcode.com)."
+            "tenantURL from the session file. Set to override the tenant URL "
+            "for a specific environment."
         ),
     )
     p.add_argument(
