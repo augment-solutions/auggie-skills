@@ -378,7 +378,14 @@ def _credential_helper_configured_for(url: str) -> bool:
     stale token, and break the helper's ``erase``→refresh→retry recovery
     loop on 401. When ``False`` (e.g. plain GitHub Actions, vanilla CI
     runners), callers fall back to env-var-based header injection.
+
+    Non-HTTP(S) URLs (``ssh://``, ``git@host:org/repo.git``, ``file://``)
+    short-circuit to ``False``: ``--get-urlmatch`` is defined for HTTP(S)
+    only and SSH transports authenticate via the ssh-agent / key, not
+    via git credential helpers, so there's no helper to defer to.
     """
+    if not url.lower().startswith(("http://", "https://")):
+        return False
     try:
         proc = subprocess.run(
             ["git", "config", "--get-urlmatch", "credential.helper", url],
@@ -439,10 +446,27 @@ def resolve_auth(repo_url: str) -> tuple[str | None, str]:
     return None, AUTH_ANONYMOUS
 
 
+# Reusable remediation hints for the bare-status-code fingerprints below.
+# Defined once so a wording change to (say) the 403 message doesn't
+# require touching every variant fingerprint.
+_HINT_403 = (
+    "Remote returned HTTP 403 (forbidden). The credential is "
+    "recognised but does not have permission for this operation. "
+    "For clone: check repo read access; for push: check write "
+    "access. SSO or IP allow-list enforcement can also produce a "
+    "403 - authorize the credential for the org or run from an "
+    "allow-listed network."
+)
+_HINT_401 = (
+    "Remote returned HTTP 401 (unauthorized). The credential was "
+    "rejected. See guidance for 'invalid credentials' above."
+)
+
+
 # Substring fingerprints of common GitHub-side auth/permission failures.
 # Lowercase-compared.  Order matters: the first match wins so the more
 # specific signal (e.g. "permission denied to") is checked before the
-# generic "403".
+# generic "status 403".
 _AUTH_FAILURE_SIGNALS: tuple[tuple[str, str, str], ...] = (
     (
         "invalid credentials",
@@ -468,11 +492,15 @@ _AUTH_FAILURE_SIGNALS: tuple[tuple[str, str, str], ...] = (
     (
         "permission denied to",
         "auth-403",
-        "The credential authenticated but lacks write access (HTTP 403). "
-        "On a GitHub App installation: edit the App's permissions to "
-        "include `Contents: Read & write`. On a PAT: ensure the token "
-        "scope includes `repo` (classic) or `Contents: write` "
-        "(fine-grained).",
+        "The credential authenticated but lacks the required repo "
+        "access (HTTP 403). For a clone this typically means no read "
+        "access; for a push, no write access. On a GitHub App "
+        "installation: edit the App's permissions to include "
+        "`Contents: Read & write` (or `Read-only` for clone-only). "
+        "On a PAT: ensure the token scope includes `repo` (classic) "
+        "or `Contents: write` (fine-grained). Org-enforced SSO or "
+        "an IP allow-list can also surface as 403 - authorize the "
+        "credential for the org or run from an allow-listed network.",
     ),
     (
         "repository not found",
@@ -483,19 +511,19 @@ _AUTH_FAILURE_SIGNALS: tuple[tuple[str, str, str], ...] = (
         "selected repositories on github.com. Otherwise verify "
         "$DEEP_WIKIS_GIT_REPO points at a repo the credential can see.",
     ),
-    (
-        "403",
-        "auth-403",
-        "Remote returned HTTP 403 (forbidden). The credential is "
-        "recognised but does not have permission for this operation. "
-        "Check write permissions on the host repo.",
-    ),
-    (
-        "401",
-        "auth-401",
-        "Remote returned HTTP 401 (unauthorized). The credential was "
-        "rejected. See guidance for 'invalid credentials' above.",
-    ),
+    # The bare-status-code fingerprints below are intentionally narrow
+    # ("status 4xx", "http 4xx", "error: 4xx", "code 4xx") so an unrelated
+    # "403" appearing in a path or filename can't false-trigger the
+    # classifier. Git/curl emit one of these forms when surfacing the
+    # actual HTTP status.
+    ("status 403", "auth-403", _HINT_403),
+    ("http 403", "auth-403", _HINT_403),
+    ("error: 403", "auth-403", _HINT_403),
+    ("code 403", "auth-403", _HINT_403),
+    ("status 401", "auth-401", _HINT_401),
+    ("http 401", "auth-401", _HINT_401),
+    ("error: 401", "auth-401", _HINT_401),
+    ("code 401", "auth-401", _HINT_401),
 )
 
 
@@ -608,7 +636,10 @@ def clone_host_repo(
             str(work_dir),
         ]
 
-    log.info("Cloning %s (branch=%s) -> %s", repo_url, branch, work_dir)
+    # ``repo_url`` typically has no userinfo but a caller could pass
+    # ``https://user:token@host/...``; redact defensively so the token
+    # never lands in logs even if the configuration is unusual.
+    log.info("Cloning %s (branch=%s) -> %s", _redact(repo_url), branch, work_dir)
     proc = _run(
         _build_clone_cmd(token),
         capture=True,

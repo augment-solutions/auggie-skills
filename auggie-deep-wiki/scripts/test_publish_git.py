@@ -242,6 +242,29 @@ class TestCredentialHelperConfiguredFor:
         monkeypatch.setattr(pg.subprocess, "run", slow)
         assert pg._credential_helper_configured_for("https://github.com/x/y.git") is False
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "git@github.com:org/repo.git",
+            "ssh://git@github.com/org/repo.git",
+            "file:///tmp/local-repo",
+            "/tmp/local-repo",
+        ],
+    )
+    def test_non_http_urls_short_circuit_to_false(self, monkeypatch, url):
+        # ``--get-urlmatch`` is HTTP(S)-only and SSH transports use the
+        # ssh-agent / key, not git credential helpers. The probe must not
+        # even shell out for these URLs.
+        called = {"n": 0}
+
+        def fake_run(cmd, **kw):
+            called["n"] += 1
+            return subprocess.CompletedProcess(cmd, 0, "store\n", "")
+
+        monkeypatch.setattr(pg.subprocess, "run", fake_run)
+        assert pg._credential_helper_configured_for(url) is False
+        assert called["n"] == 0, "git config must not be invoked for non-HTTP URLs"
+
 
 class TestResolveAuth:
     """Three explicit modes; the chosen mode drives both behaviour and
@@ -303,6 +326,36 @@ class TestClassifyGitError:
 
     def test_empty_stderr_returns_none(self):
         assert pg._classify_git_error("") == (None, None)
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            # Bare "403" / "401" must not match: only the disambiguated
+            # forms ("status 403", "http 403", "error: 403", "code 403")
+            # do.  These strings would have false-fired the older loose
+            # classifier.
+            "fatal: unable to access /tmp/path-with-403-in-it",
+            "warning: redirected through 401-proxy.example.com",
+            "remote: 4030 objects counted",
+            "fatal: bad object refs/tags/v1.401.0",
+        ],
+    )
+    def test_bare_status_codes_do_not_false_match(self, stderr):
+        assert pg._classify_git_error(stderr) == (None, None)
+
+    @pytest.mark.parametrize(
+        "stderr,expected_category",
+        [
+            ("fatal: unable to access ...: The requested URL returned error: status 403", "auth-403"),
+            ("HTTP 403 returned\n", "auth-403"),
+            ("curl 22: error: 401 Unauthorized", "auth-401"),
+            ("upload-pack: status 401\n", "auth-401"),
+        ],
+    )
+    def test_disambiguated_status_codes_match(self, stderr, expected_category):
+        category, hint = pg._classify_git_error(stderr)
+        assert category == expected_category
+        assert hint
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +779,26 @@ class TestCloneHostRepo:
 
         # Exactly one attempt — no anonymous retry on non-auth errors.
         assert len(calls) == 1
+
+    def test_clone_log_redacts_url_userinfo(self, tmp_path, monkeypatch, caplog):
+        """A caller-supplied URL with embedded ``user:token@`` userinfo
+        must not leak into the log line that announces the clone."""
+        work_dir = tmp_path / "deep-wikis"
+
+        def fake_run(cmd, **kwargs):
+            work_dir.mkdir(parents=True, exist_ok=True)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(pg, "_run", fake_run)
+        caplog.set_level("INFO", logger=pg.log.name)
+        pg.clone_host_repo(
+            "https://user:ghp_supersecret@github.com/x/y.git",
+            "main", work_dir, token=None,
+        )
+        joined = "\n".join(rec.getMessage() for rec in caplog.records)
+        assert "ghp_supersecret" not in joined
+        assert "user:" not in joined  # userinfo prefix also stripped
+        assert "***@github.com" in joined
 
 
 # ---------------------------------------------------------------------------
