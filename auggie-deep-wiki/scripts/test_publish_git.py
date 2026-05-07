@@ -266,8 +266,41 @@ class TestCredentialHelperConfiguredFor:
         assert called["n"] == 0, "git config must not be invoked for non-HTTP URLs"
 
 
+class TestIsSshRepoUrl:
+    """SSH detection feeds the dedicated AUTH_SSH path in ``resolve_auth``;
+    a misclassification would either inject an unwanted ``Authorization``
+    header into an SSH URL or label an HTTPS URL as SSH in logs."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "git@github.com:org/repo.git",
+            "ssh://git@github.com/org/repo.git",
+            "git+ssh://git@github.com/org/repo.git",
+            "user@host.example.com:path/to/repo.git",
+        ],
+    )
+    def test_ssh_forms_detected(self, url):
+        assert pg._is_ssh_repo_url(url) is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://github.com/org/repo.git",
+            "http://example.com/repo.git",
+            "file:///tmp/local-repo",
+            "/tmp/local-repo",
+            # email-like noise without a host:path colon must not be SSH.
+            "noreply@github.com",
+            "",
+        ],
+    )
+    def test_non_ssh_forms_rejected(self, url):
+        assert pg._is_ssh_repo_url(url) is False
+
+
 class TestResolveAuth:
-    """Three explicit modes; the chosen mode drives both behaviour and
+    """Four explicit modes; the chosen mode drives both behaviour and
     diagnostic logging."""
 
     def test_helper_mode_when_helper_present(self, monkeypatch):
@@ -298,6 +331,33 @@ class TestResolveAuth:
         assert token is None
         assert mode == pg.AUTH_ANONYMOUS
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "git@github.com:org/repo.git",
+            "ssh://git@github.com/org/repo.git",
+        ],
+    )
+    def test_ssh_mode_takes_precedence_over_env_token(self, monkeypatch, url):
+        # A token in the environment must NOT cause an SSH URL to be
+        # classified as AUTH_HEADER - we have nowhere to inject the
+        # header and the diagnostic message would be wrong.  The helper
+        # probe must also be skipped (irrelevant for SSH transports).
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_xxx")
+        called = {"helper_probe": 0}
+
+        def fake_helper(url):
+            called["helper_probe"] += 1
+            return True  # would falsely trigger AUTH_HELPER if reached
+
+        monkeypatch.setattr(pg, "_credential_helper_configured_for", fake_helper)
+        token, mode = pg.resolve_auth(url)
+        assert token is None
+        assert mode == pg.AUTH_SSH
+        assert called["helper_probe"] == 0, (
+            "SSH branch must short-circuit before the helper probe"
+        )
+
 
 class TestClassifyGitError:
     """Maps known GitHub error fingerprints to actionable hints. Returns
@@ -314,6 +374,20 @@ class TestClassifyGitError:
             ("remote: Repository not found.\nfatal: repository 'x' not found", "auth-404"),
             ("error: 403 Forbidden\n", "auth-403"),
             ("HTTP 401 returned\n", "auth-401"),
+            # Generic git form when a credential is supplied but the
+            # remote rejects it without echoing "invalid credentials"
+            # or a bare HTTP status.
+            (
+                "fatal: Authentication failed for 'https://github.com/org/repo/'",
+                "auth-401",
+            ),
+            # GitHub push-side wording when the credential authenticated
+            # but lacks write scope.  Specific enough to deserve its own
+            # fingerprint rather than relying on the bare "403" forms.
+            (
+                "remote: Write access to repository not granted.\nfatal: unable to access",
+                "auth-403",
+            ),
         ],
     )
     def test_known_signals_classified(self, stderr, expected_category):

@@ -35,7 +35,8 @@ Before invoking the skill, make sure the user has:
 - Optional, for `--publish-git`: `git` on `$PATH` (already required
   for the clone step) plus push access to the host Astro repo. Auth
   is auto-detected and logged at the start of the publish step in one
-  of three modes:
+  of four modes (HTTPS gets one of the first two or `anonymous`; SSH
+  URLs always use `ssh-key`):
   - **`git-credential-helper`** — preferred. Used whenever git already
     has a credential helper configured for the host (e.g. the
     Poseidon/Cosmos sandbox installs one for `https://github.com` at
@@ -51,12 +52,15 @@ Before invoking the skill, make sure the user has:
     git invocation — never written to `.git/config` or logs. Tokens
     are not auto-refreshed for the run, so very long runs may need
     a re-publish if the env-var token expires mid-flight.
-  - **`anonymous`** — last resort. Used when no helper is configured
-    and no token is set. Public-repo clones still work; push and
-    private-repo clones will fail with an actionable error.
-
-  An SSH-style URL (`git@host:org/repo.git`) is also supported via a
-  configured SSH key.
+  - **`ssh-key`** — used when `$DEEP_WIKIS_GIT_REPO` is an SSH URL
+    (`git@host:org/repo.git` or `ssh://...`). The script does not
+    inject any token; ssh-agent / the configured private key supplies
+    the credential. A failure here points at the key, the agent, or
+    the remote `authorized_keys` / deploy-key configuration — not at
+    `$GITHUB_TOKEN`.
+  - **`anonymous`** — last resort. Used for HTTPS URLs when no helper
+    is configured and no token is set. Public-repo clones still work;
+    push and private-repo clones will fail with an actionable error.
 
   **Also requires `node` + `npm`** so the publish step can run
   `astro build` against the host clone before pushing — that
@@ -154,14 +158,19 @@ What happens, in order:
    `$DEEP_WIKIS_GIT_REPO`. If neither is set, the publish step aborts
    with an actionable error and the local output is unaffected.
 2. The auth mode is detected and logged (see Prerequisites for the
-   three modes). `git clone --depth=1 --branch <branch> <repo>` runs
+   four modes). `git clone --depth=1 --branch <branch> <repo>` runs
    into a temp directory using whichever credential source the
    detected mode dictates. When the initial clone fails with an
-   auth-class error (HTTP 401/403/404) **and** a token was used, the
-   script retries once anonymously — this rescues the common case of
-   a public host repo being hit by a token that doesn't cover it
-   (e.g. a GitHub App installation token bound to the source repo's
-   owner).
+   auth-class error (HTTP 401/403/404) **and** the run was using
+   `http-authorization-header` mode (i.e. an env-var token was
+   injected via `-c http.extraHeader=…`), the script retries once
+   without the header — this rescues the common case of a public
+   host repo being hit by a token that doesn't cover it (e.g. a
+   GitHub App installation token bound to the source repo's owner).
+   The retry is intentionally **not** attempted in
+   `git-credential-helper` mode (the helper owns credential lifecycle
+   and we cannot suppress it from a single invocation) or in
+   `ssh-key` / `anonymous` modes (no header to drop).
 3. The generated `wiki.mdx` is rewrapped with valid Astro frontmatter
    (title, description, repo URL, last-updated/commit, stars,
    language, topics) and written to

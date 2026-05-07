@@ -162,9 +162,14 @@ What happens:
    temp directory. The script auto-detects which credential source to
    use and logs the chosen mode at the start of the run (see
    "Authentication" below). When the initial clone fails with a
-   401/403/404 **and** a token was used, the script retries once
-   anonymously so a public host repo still works when the supplied
-   token doesn't cover it.
+   401/403/404 **and** the script was running in
+   `http-authorization-header` mode (i.e. a token was injected via
+   `-c http.extraHeader=…`), it retries once without the header so a
+   public host repo still works when the env-var token doesn't cover
+   it. The retry is intentionally not attempted in `git-credential-helper`
+   mode (the helper owns credential lifecycle and we cannot suppress
+   it from a single invocation) or in `ssh-key` / `anonymous` modes
+   (no header to drop).
 2. `wiki.mdx` + `repo_metadata.json` are converted into an Astro
    content-collection entry at
    `src/content/wikis/<slug>/index.mdx`. Any existing directory for
@@ -201,19 +206,20 @@ To bootstrap your own:
 
 ### Authentication
 
-`publish_git.py` picks one of three modes at the start of every run
+`publish_git.py` picks one of four modes at the start of every run
 and logs the choice as `Auth: <mode>`:
 
 | Mode                          | When                                                         | Notes |
 | ----------------------------- | ------------------------------------------------------------ | ----- |
-| `git-credential-helper`       | A git credential helper is configured for the host (Cosmos sandbox, `gh auth login`) | Preferred. Helper-managed tokens stay fresh and survive 401 via `erase`→refresh. Env vars are intentionally ignored to avoid pinning a stale token. |
-| `http-authorization-header`   | No helper configured, but `GITHUB_TOKEN` (or `GH_TOKEN`) is set | Fallback. Token injected via `-c http.extraHeader=…` for that single invocation — never written to `.git/config` or logs. No auto-refresh; very long runs may need a re-publish if the env var expires. |
-| `anonymous`                   | No helper, no token                                          | Public-repo clone works; push and private-repo clone fail with an actionable error. |
+| `git-credential-helper`       | HTTPS URL and a git credential helper is configured for the host (Cosmos sandbox, `gh auth login`) | Preferred. Helper-managed tokens stay fresh and survive 401 via `erase`→refresh. Env vars are intentionally ignored to avoid pinning a stale token. |
+| `http-authorization-header`   | HTTPS URL, no helper configured, but `GITHUB_TOKEN` (or `GH_TOKEN`) is set | Fallback. Token injected via `-c http.extraHeader=…` for that single invocation — never written to `.git/config` or logs. No auto-refresh; very long runs may need a re-publish if the env var expires. |
+| `ssh-key`                     | URL is an SSH transport (`git@host:org/repo.git` or `ssh://...`) | ssh-agent / private key supplies the credential. `$GITHUB_TOKEN` is ignored. A failure here points at the key, the agent, or the remote `authorized_keys` / deploy-key configuration. |
+| `anonymous`                   | HTTPS URL, no helper, no token                               | Public-repo clone works; push and private-repo clone fail with an actionable error. |
 
 | Environment            | Typical mode                          | What to set                                              |
 | ---------------------- | ------------------------------------- | -------------------------------------------------------- |
 | Local (HTTPS clone)    | `git-credential-helper` (preferred)   | `gh auth login`, or set `GITHUB_TOKEN` (PAT with `contents: write`) for header-mode fallback |
-| Local (SSH clone)      | n/a — SSH key handles auth            | Use `git@github.com:<org>/deep-wikis.git` and a configured key |
+| Local (SSH clone)      | `ssh-key`                             | Use `git@github.com:<org>/deep-wikis.git` and a configured key (the script logs `Auth: SSH key …`) |
 | Poseidon / Cosmos      | `git-credential-helper` (preferred)   | Just set `DEEP_WIKIS_GIT_REPO`. The sandbox installs the helper at boot and refreshes the installation token on demand. |
 | GitHub Actions         | `http-authorization-header`           | `GITHUB_TOKEN` is provided by the runner; just set `DEEP_WIKIS_GIT_REPO` |
 
