@@ -543,7 +543,12 @@ _HINT_403 = (
 )
 _HINT_401 = (
     "Remote returned HTTP 401 (unauthorized). The credential was "
-    "rejected. See guidance for 'invalid credentials' above."
+    "supplied but the server rejected it as invalid or expired. "
+    "If running on Cosmos: check that the GitHub App is installed "
+    "on the host repo's owner and the installation has not been "
+    "revoked - the helper should refresh on the next attempt. "
+    "If running locally: refresh the token (`gh auth refresh` or "
+    "regenerate $GITHUB_TOKEN)."
 )
 _HINT_404 = (
     "Remote returned HTTP 404 (not found). The credential may be "
