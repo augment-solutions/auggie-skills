@@ -439,6 +439,27 @@ def _is_ssh_repo_url(url: str) -> bool:
         return False
     if lowered.startswith(("/", "./", "../", "~")):
         return False
+    # Bracketed IPv6 scp-like form: ``[user@][::1]:path`` (the brackets
+    # disambiguate the host's internal ``:`` from the host/path
+    # separator).  Detect this before the generic single-``:`` parse so
+    # an IPv6 literal isn't truncated at its first colon.
+    bracket_open = stripped.find("[")
+    bracket_close_sep = stripped.find("]:")  # ``]:`` is the host/path separator
+    if (
+        bracket_open != -1
+        and bracket_close_sep > bracket_open
+    ):
+        # Any ``/`` must appear after the ``]:`` separator (i.e. inside
+        # the path component).  A ``/`` before ``]`` would mean the
+        # bracket-pair is not the host envelope.
+        slash = stripped.find("/")
+        if slash == -1 or slash > bracket_close_sep:
+            v6 = stripped[bracket_open + 1 : bracket_close_sep]
+            # Anything between ``[`` and ``]`` must look like an IPv6
+            # literal (hex digits and ``:``); reject obvious non-IPv6
+            # garbage so we don't accidentally widen the match.
+            if v6 and all(c in "0123456789abcdefABCDEF:" for c in v6):
+                return True
     # scp-like: ``[user@]host:path``.  Require a ``:`` that appears
     # before any ``/`` (otherwise it's a path with a ``:`` somewhere
     # in it, not a host:path separator).
@@ -523,6 +544,13 @@ _HINT_403 = (
 _HINT_401 = (
     "Remote returned HTTP 401 (unauthorized). The credential was "
     "rejected. See guidance for 'invalid credentials' above."
+)
+_HINT_404 = (
+    "Remote returned HTTP 404 (not found). The credential may be "
+    "valid but the repo is not in its scope. On a GitHub App "
+    "installation: add the host repo to the App's selected "
+    "repositories. Otherwise verify the repo URL points at a repo "
+    "the credential can see."
 )
 
 
@@ -615,6 +643,10 @@ _AUTH_FAILURE_SIGNALS: tuple[tuple[str, str, str], ...] = (
     ("http 401", "auth-401", _HINT_401),
     ("error: 401", "auth-401", _HINT_401),
     ("code 401", "auth-401", _HINT_401),
+    ("status 404", "auth-404", _HINT_404),
+    ("http 404", "auth-404", _HINT_404),
+    ("error: 404", "auth-404", _HINT_404),
+    ("code 404", "auth-404", _HINT_404),
 )
 
 

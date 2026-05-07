@@ -207,12 +207,15 @@ To bootstrap your own:
 ### Authentication
 
 `publish_git.py` picks one of four modes at the start of every run
-and logs the choice on a single line that begins with the literal
-token `Auth: <mode> -` (the dash is followed by a one-sentence,
-human-readable explanation). The `<mode>` token is one of
-`git-credential-helper`, `http-authorization-header`, `ssh-key`, or
-`anonymous`, and is stable across releases — agents and grep-based
-tooling can match on the token directly. Examples:
+and logs the choice on a single line whose message contains the
+literal token `Auth: <mode> -` (followed by a one-sentence,
+human-readable explanation). The full emitted line is prefixed by
+the standard `logging` timestamp/level/logger preamble, so a
+substring match like `Auth: ([\w-]+) -` (not anchored at start of
+line) is the right way for tooling to extract the mode. The
+`<mode>` token is one of `git-credential-helper`,
+`http-authorization-header`, `ssh-key`, or `anonymous`, and is
+stable across releases. Example log messages (preamble omitted):
 
 ```text
 Auth: git-credential-helper - deferring to git credential helper for https://github.com/... (env GITHUB_TOKEN/GH_TOKEN ignored to keep helper-managed token fresh).
@@ -231,7 +234,7 @@ Auth: anonymous - no credential helper, no GITHUB_TOKEN/GH_TOKEN. Push and priva
 | Environment            | Typical mode                          | What to set                                              |
 | ---------------------- | ------------------------------------- | -------------------------------------------------------- |
 | Local (HTTPS clone)    | `git-credential-helper` (preferred)   | `gh auth login`, or set `GITHUB_TOKEN` (PAT with `contents: write`) for header-mode fallback |
-| Local (SSH clone)      | `ssh-key`                             | Use `git@github.com:<org>/deep-wikis.git` and a configured key (the script logs `Auth: SSH key …`) |
+| Local (SSH clone)      | `ssh-key`                             | Use `git@github.com:<org>/deep-wikis.git` and a configured key (the script logs `Auth: ssh-key - …`) |
 | Poseidon / Cosmos      | `git-credential-helper` (preferred)   | Just set `DEEP_WIKIS_GIT_REPO`. The sandbox installs the helper at boot and refreshes the installation token on demand. |
 | GitHub Actions         | `http-authorization-header`           | `GITHUB_TOKEN` is provided by the runner; just set `DEEP_WIKIS_GIT_REPO` |
 

@@ -284,6 +284,13 @@ class TestIsSshRepoUrl:
             "gh-work:org/repo.git",
             # Surrounding whitespace must not change the verdict.
             "  git@github.com:org/repo.git  ",
+            # IPv6 bracketed scp-like form. The brackets disambiguate
+            # the host's internal ``:`` from the host/path separator;
+            # without explicit handling the first ``:`` would chop the
+            # IPv6 literal in half and yield a single-character host.
+            "[::1]:repo.git",
+            "user@[::1]:repo.git",
+            "git@[fe80::1]:org/repo.git",
         ],
     )
     def test_ssh_forms_detected(self, url):
@@ -312,6 +319,10 @@ class TestIsSshRepoUrl:
             "   ",
             # Path with a colon somewhere inside but no host prefix.
             "/var/git/has:colon/repo",
+            # Bracketed but non-IPv6 contents must not be widened into
+            # the IPv6 fast-path. Brackets here are syntactic noise.
+            "[not-an-ip-literal]:repo.git",
+            "[g::z]:repo.git",  # 'g' / 'z' aren't hex digits
         ],
     )
     def test_non_ssh_forms_rejected(self, url):
@@ -456,6 +467,15 @@ class TestClassifyGitError:
             ("HTTP 403 returned\n", "auth-403"),
             ("curl 22: error: 401 Unauthorized", "auth-401"),
             ("upload-pack: status 401\n", "auth-401"),
+            # 404 disambiguated forms.  Without these the script would
+            # surface the raw stderr instead of the auth-404 hint, and
+            # clone_host_repo would also miss the anonymous-retry path
+            # (which keys off ``category in ('auth-401', 'auth-403',
+            # 'auth-404')``).
+            ("The requested URL returned error: 404", "auth-404"),
+            ("HTTP 404 not found\n", "auth-404"),
+            ("upload-pack: status 404\n", "auth-404"),
+            ("error: 404 not found", "auth-404"),
         ],
     )
     def test_disambiguated_status_codes_match(self, stderr, expected_category):
