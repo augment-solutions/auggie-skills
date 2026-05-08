@@ -13,7 +13,11 @@ Pipeline (all steps share one indexed workspace + one cache dir):
   5. for each section in the structure, run `auggie` with
      prompts/wiki_section.txt -> sections/<id>.mdx
   6. assemble sections/*.mdx into a single wiki.mdx (with last-updated line)
-  7. clean up the workspace and cache temp dirs
+  7. (optional, --publish-git) commit and push wiki.mdx to a host Astro repo
+  8. clean up the workspace and cache temp dirs ONLY when step 7 ran and
+     actually pushed a commit; otherwise the temp dirs are preserved so
+     the operator can inspect outputs, retry the push, or re-run with
+     --workspace-dir / --cache-dir to skip the re-clone and re-index
 
 Auth: relies on the user's existing Augment auth.
   - ~/.augment/.auggie.json (preferred) -> passed via --augment-session-json
@@ -554,7 +558,9 @@ def build_static_optional(output_dir: Path) -> None:
         log.warning("Static viewer emission failed: %s", exc)
 
 
-def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> bool:
+def publish_git_optional(
+    args: argparse.Namespace, output_dir: Path
+) -> tuple[bool, bool]:
     """Optional Git-backed Astro publish step.
 
     Only runs when ``--publish-git`` is set. Clones a host Astro
@@ -563,12 +569,20 @@ def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> bool:
     omitted, so this step is purely additive and any failure here
     leaves the local ``wiki.mdx``/``index.html`` deliverables intact.
 
-    Returns ``True`` when the publish completed (or was a successful
-    dry run), ``False`` when build validation was skipped due to
-    missing tooling so the orchestrator can propagate exit code 3.
+    Returns ``(publish_ok, pushed)``:
+      * ``publish_ok`` is ``True`` when the publish completed (or was a
+        successful dry run), ``False`` when build validation was
+        skipped due to missing tooling so the orchestrator can
+        propagate exit code 3.
+      * ``pushed`` is ``True`` only when a real ``git push`` actually
+        landed a commit on the host repo. ``--no-push`` dry runs,
+        idempotent re-runs (nothing to commit), tooling-missing
+        bail-outs, and runs without ``--publish-git`` all report
+        ``False`` so callers can gate temp-dir cleanup on a confirmed
+        publish.
     """
     if not args.publish_git:
-        return True
+        return True, False
     publisher = Path(__file__).parent / "publish_git.py"
     if not publisher.exists():
         raise RuntimeError(
@@ -620,7 +634,7 @@ def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> bool:
             result.slug,
             result.branch,
         )
-        return False
+        return False, False
     log.info(
         "Published %s -> %s (commit=%s pushed=%s)",
         result.slug,
@@ -628,7 +642,7 @@ def publish_git_optional(args: argparse.Namespace, output_dir: Path) -> bool:
         result.commit_sha or "<no-change>",
         result.pushed,
     )
-    return True
+    return True, bool(result.pushed)
 
 
 # ---------------------------------------------------------------------------
@@ -641,8 +655,16 @@ def generate_wiki(args: argparse.Namespace) -> tuple[Path, bool]:
 
     workspace_dir = args.workspace_dir or tempfile.mkdtemp(prefix="deep_wiki_workspace_")
     cache_dir = args.cache_dir or tempfile.mkdtemp(prefix="deep_wiki_cache_")
-    cleanup_workspace = args.workspace_dir is None and not args.no_cleanup
-    cleanup_cache = args.cache_dir is None and not args.no_cleanup
+    # Cleanup is gated on a confirmed ``git push`` against the host
+    # Astro repo: we only ever delete temp dirs after the publish step
+    # actually landed a commit on the remote.  An explicit
+    # ``--workspace-dir`` / ``--cache-dir`` is never owned by us (the
+    # user supplied it); ``--no-cleanup`` is an explicit opt-out.  The
+    # final decision is made in the ``finally`` block below once we
+    # know whether the push succeeded.
+    cleanup_workspace_eligible = args.workspace_dir is None and not args.no_cleanup
+    cleanup_cache_eligible = args.cache_dir is None and not args.no_cleanup
+    pushed = False
 
     log.info("Workspace: %s", workspace_dir)
     log.info("Cache: %s", cache_dir)
@@ -691,18 +713,42 @@ def generate_wiki(args: argparse.Namespace) -> tuple[Path, bool]:
         if not args.no_static:
             build_static_optional(output_dir)
 
-        publish_ok = publish_git_optional(args, output_dir)
+        publish_ok, pushed = publish_git_optional(args, output_dir)
 
         elapsed = time.monotonic() - started
         log.info("✓ Wiki generated in %.1fs -> %s", elapsed, wiki_path)
         return wiki_path, publish_ok
     finally:
+        # Only remove temp dirs after a confirmed push: ``--publish-git``
+        # was set, the publish step finished, and ``commit_and_push``
+        # reported a real ``git push``.  Anything short of that
+        # (no ``--publish-git``, ``--no-push`` dry run, idempotent
+        # re-run with nothing to commit, build/push failure,
+        # KeyboardInterrupt, or an exception anywhere upstream) leaves
+        # the workspace and cache on disk so the operator can inspect
+        # ``__deepwiki_*`` outputs, retry the push manually, or
+        # re-run the orchestrator with the same ``--workspace-dir`` /
+        # ``--cache-dir`` to avoid re-cloning and re-indexing.
+        cleanup_workspace = cleanup_workspace_eligible and pushed
+        cleanup_cache = cleanup_cache_eligible and pushed
         if cleanup_workspace:
             log.info("Cleaning up workspace %s", workspace_dir)
             shutil.rmtree(workspace_dir, ignore_errors=True)
+        elif cleanup_workspace_eligible:
+            log.info(
+                "Preserving workspace %s (no successful git push; pass "
+                "--workspace-dir to reuse it on the next run)",
+                workspace_dir,
+            )
         if cleanup_cache:
             log.info("Cleaning up cache %s", cache_dir)
             shutil.rmtree(cache_dir, ignore_errors=True)
+        elif cleanup_cache_eligible:
+            log.info(
+                "Preserving cache %s (no successful git push; pass "
+                "--cache-dir to reuse it on the next run)",
+                cache_dir,
+            )
 
 
 
@@ -764,7 +810,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-cleanup",
         action="store_true",
-        help="Keep workspace and cache temp dirs after generation (debugging)",
+        help=(
+            "Force-keep workspace and cache temp dirs after generation "
+            "(debugging). Note: temp dirs are already preserved by "
+            "default unless --publish-git ran and a real git push "
+            "succeeded; this flag suppresses cleanup even on a "
+            "successful push."
+        ),
     )
     p.add_argument(
         "--skip-validate",
