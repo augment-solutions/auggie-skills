@@ -21,7 +21,7 @@ compatibility: "Requires p4 CLI (Helix Command-Line Client) and/or P4Python (pip
 |---|---|
 | Simple one-off commands, shell scripts | **p4 CLI** |
 | Python agents, structured data, error handling | **P4Python SDK** |
-| Both are acceptable — prefer P4Python when in a Python context for richer error handling. |
+| Either interface is acceptable | Prefer **P4Python** in a Python context for richer error handling. |
 
 ---
 

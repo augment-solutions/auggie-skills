@@ -117,7 +117,7 @@ A few things to keep in mind when writing agent workflows with this skill:
 ## File Structure
 
 ```
-perforce/
+perforce-scm/
 ├── README.md               ← You are here
 ├── SKILL.md                ← Main skill instructions (loaded by agent)
 └── references/
