@@ -122,8 +122,12 @@ Common flags:
 - `--api-url`: defaults to `$AUGMENT_API_URL` or staging.
 - `--workspace-dir` / `--cache-dir`: reuse existing dirs (skips re-clone /
   re-index across multiple runs of the same repo).
-- `--no-cleanup`: keep the temp workspace + cache dirs after generation
-  (useful for debugging an `auggie` failure).
+- `--no-cleanup`: force-keep the temp workspace + cache dirs after
+  generation. Note: as of the cleanup-after-push change, temp dirs are
+  already preserved by default unless `--publish-git` ran **and** a
+  real `git push` succeeded. Pass `--no-cleanup` only when you want to
+  also keep the dirs around after a successful publish (e.g. debugging
+  the indexed workspace).
 - `--skip-validate`: skip the optional Node MDX validation pass.
 - `--no-static`: skip auto-emitting `<output-dir>/index.html` (the
   self-contained browser viewer; emitted by default).
@@ -203,6 +207,16 @@ What happens, in order:
    permissions, or add the repo to the App's selected list.
 7. The host site's CD (Vercel auto-deploy on push, GitHub Pages
    action, etc.) rebuilds and the wiki appears at `/wikis/<slug>/`.
+8. **Only after the push in step 6 succeeds** does the orchestrator
+   remove the cloned-source workspace and the auggie cache temp
+   dirs it created. If the publish step is skipped (no
+   `--publish-git`), aborts (build failure, push rejected, missing
+   tooling), or is a `--no-push` dry run, both temp dirs are
+   preserved so the operator can inspect outputs, retry the push
+   manually, or re-run with `--workspace-dir` / `--cache-dir` to
+   skip the re-clone and re-index. `--no-cleanup` continues to
+   suppress cleanup unconditionally; explicit `--workspace-dir` /
+   `--cache-dir` are user-owned and never deleted.
 
 Multi-wiki layout: every wiki is one entry in the `wikis` content
 collection, so a single host repo hosts all of them. The landing page
@@ -263,8 +277,9 @@ can be packaged into any zip/tarball alongside the rest of the output.
   Gateway/Unavailable` with exponential backoff (30s → 5m, max 3 attempts).
 - **Failure modes**: a malformed `wiki_structure.json` aborts the run with a
   clear error. If `auggie` writes nothing to the expected output path the
-  step also aborts; rerun with `--verbose --no-cleanup` to inspect the
-  workspace.
+  step also aborts; the workspace and cache temp dirs are preserved on any
+  failure (and on any run that didn't push), so rerun with `--verbose` and
+  inspect `<workspace>/__deepwiki_*` directly.
 
 ## Previewing the output in a browser
 

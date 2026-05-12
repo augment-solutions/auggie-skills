@@ -81,7 +81,7 @@ Run with `--help` for all flags. The most useful ones during iteration:
 
 | Flag                       | Why                                          |
 | -------------------------- | -------------------------------------------- |
-| `--no-cleanup`             | Keep workspace + cache for post-mortem       |
+| `--no-cleanup`             | Force-keep workspace + cache (default already preserves them unless `--publish-git` pushed) |
 | `--workspace-dir <path>`   | Reuse a clone (skips `git clone`)            |
 | `--cache-dir <path>`       | Reuse the auggie index across runs           |
 | `--skip-validate`          | Skip the Node MDX validation pass            |
@@ -359,8 +359,9 @@ in `scripts/generate_wiki.py`.
 | ------------------------------------------- | ----------------------------------------------- |
 | `auggie binary not found`                   | Install Auggie or pass `--auggie-bin /path`     |
 | `401 Unauthorized` from auggie              | Run `auggie login`; or export `AUGMENT_API_TOKEN`|
-| `Step N produced no output`                 | Rerun with `--verbose --no-cleanup` and inspect |
+| `Step N produced no output`                 | Rerun with `--verbose` and inspect              |
 |                                             | `<workspace>/__deepwiki_*` for partial output   |
+|                                             | (temp dirs are preserved on any non-push run)   |
 | MDX validation skipped                      | `cd ~/.augment/skills/auggie-deep-wiki && npm i`|
 | Mermaid diagram doesn't render in your CMS  | The CMS may need a remark/rehype plugin —       |
 |                                             | the MDX itself compiles fine                    |

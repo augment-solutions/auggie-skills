@@ -110,9 +110,18 @@ instructions) and any consumers of `wiki.mdx` to keep them in sync.
 - `auggie` is retried up to 3 times on transient errors containing
   `502`, `503`, `504`, `bad gateway`, or `unavailable`. Backoff: 30s → 60s
   → 120s (capped at 300s).
-- Workspace and cache temp dirs are removed at the end of a run unless
-  `--no-cleanup` is set, or unless the user passed an explicit
-  `--workspace-dir` / `--cache-dir` (in which case the orchestrator never
-  deletes user-supplied paths).
+- Workspace and cache temp dirs are removed at the end of a run **only
+  when** `--publish-git` ran and `commit_and_push` actually landed a
+  commit on the host repo (i.e. `result.pushed == True`). Any other
+  outcome — no `--publish-git`, `--no-push` dry run, idempotent
+  re-run with nothing to commit, build failure, push rejection,
+  missing `node`/`npm` tooling, `KeyboardInterrupt`, or an exception
+  earlier in the pipeline — leaves both temp dirs on disk so the
+  operator can inspect `__deepwiki_*` outputs, retry the push
+  manually, or re-run the orchestrator with the same
+  `--workspace-dir` / `--cache-dir` to skip the re-clone and re-index.
+  `--no-cleanup` continues to suppress cleanup unconditionally;
+  explicit `--workspace-dir` / `--cache-dir` are user-owned and never
+  deleted.
 - A `KeyboardInterrupt` exits with code 130; any other failure exits 1
   (or 2 if `git`/`auggie` are missing).
