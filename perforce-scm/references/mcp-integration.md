@@ -50,8 +50,11 @@ Even when MCP is present, fall back to `p4` CLI / P4Python for:
   — MCP assumes a working connection.
 - **Classic branch `integrate`** for non-stream depots (`p4 integrate -b
   branch_spec`) — MCP focuses on streams.
-- **Manual conflict resolution** with `p4 resolve -at` / `-ay` / interactive
-  edits — MCP tools typically expose only auto-resolve.
+- **Advanced conflict resolution edge cases** — `modify_files` → `resolve`
+  supports `auto`, `theirs`, `yours`, and `preview` modes; use the CLI
+  (`p4 resolve -at` / `-ay` / interactive) only when you need a resolve strategy
+  the MCP tool does not expose (e.g., programmatic three-way merge with custom
+  merge driver).
 - **Diagnostics & auditing**: `p4 info`, `p4 monitor show`, `p4 -ztag`,
   `p4 changes -m N`, `p4 filelog`.
 - **Workspace cleanup at scale** (delete many stale clients, batch reverts).
