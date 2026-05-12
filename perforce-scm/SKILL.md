@@ -1,5 +1,5 @@
 ---
-name: perforce
+name: perforce-scm
 description: >
   Use this skill whenever the agent needs to interact with a Perforce (Helix Core) source
   control system. Covers both the p4 CLI and P4Python SDK on Linux/macOS. Trigger this skill
@@ -197,7 +197,7 @@ p4 edit //depot/project/src/main.c
 # ... edit /home/agent/workspace/project/src/main.c ...
 
 # 3. Create a named changelist
-CL=$(p4 change -o | sed 's/<enter description here>/Fix bug 1234/' | p4 change -i | grep -oP '(?<=Change )\d+')
+CL=$(p4 change -o | sed 's/<enter description here>/Fix bug 1234/' | p4 change -i | grep -E '^Change [0-9]+ created' | awk '{print $2}')
 
 # 4. Move opened files into the changelist
 p4 reopen -c $CL //depot/project/src/main.c

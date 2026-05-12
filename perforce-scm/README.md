@@ -42,7 +42,7 @@ A companion reference file (`references/branching.md`) covers advanced branching
 Place the unpacked skill folder in your skills directory and reference it in your agent configuration:
 ```
 skills/
-└── perforce/
+└── perforce-scm/
     ├── SKILL.md
     └── references/
         └── branching.md
