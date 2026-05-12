@@ -28,10 +28,11 @@ approval flows consistently.
 **Detection heuristic** (run from agent context, in this order):
 
 1. **Tool-list probe (most reliable)** — Inspect the available tool list for any
-   tool name matching `query_changelists`, `modify_changelists`, `query_files`,
-   `modify_files`, `query_reviews`, `modify_reviews`, `query_streams`,
-   `modify_streams`, `query_workspaces`, or `modify_workspaces`. If any of these
-   are present, MCP is available — regardless of how the server was named.
+   tool name matching `query_changelists`, `modify_changelists`, `query_shelves`,
+   `modify_shelves`, `query_files`, `modify_files`, `query_reviews`,
+   `modify_reviews`, `query_streams`, `modify_streams`, `query_workspaces`, or
+   `modify_workspaces`. If any of these are present, MCP is available —
+   regardless of how the server was named.
 2. **Server-name hint (advisory only)** — If your agent harness exposes MCP
    server metadata, look for a name matching the patterns `p4*mcp*` or
    `perforce*mcp*` (e.g., `p4mcp-server`, `perforce-p4-mcp`,
