@@ -22,6 +22,14 @@ A companion reference file (`references/branching.md`) covers advanced branching
 
 ---
 
+## Perforce MCP Integration
+
+If the [Perforce MCP Server (`p4mcp-server`)](https://github.com/perforce/p4mcp-server) is attached to the agent session, this skill **detects it and prefers MCP tools over raw `p4` / P4Python calls** to avoid duplicating capabilities the MCP already provides (changelist management, file operations, workspace setup, stream workflows, and Swarm code review).
+
+The skill keeps full CLI/SDK coverage for cases the MCP does not handle (low-level authentication, classic branch `integrate`, manual conflict resolution, diagnostics). See [`references/mcp-integration.md`](references/mcp-integration.md) for the detection heuristic, the MCP tool catalog, and the section-by-section mapping.
+
+---
+
 ## Requirements
 
 - **p4 CLI** — [Download Helix Command-Line Client](https://www.perforce.com/downloads/helix-command-line-client-p4)
@@ -45,7 +53,8 @@ skills/
 └── perforce-scm/
     ├── SKILL.md
     └── references/
-        └── branching.md
+        ├── branching.md
+        └── mcp-integration.md
 ```
 
 ---
@@ -121,7 +130,8 @@ perforce-scm/
 ├── README.md               ← You are here
 ├── SKILL.md                ← Main skill instructions (loaded by agent)
 └── references/
-    └── branching.md        ← Deep reference: streams, integrate, resolve
+    ├── branching.md        ← Deep reference: streams, integrate, resolve
+    └── mcp-integration.md  ← MCP tool catalog and routing rules
 ```
 
 ---
