@@ -15,7 +15,52 @@ compatibility: "Requires p4 CLI (Helix Command-Line Client) and/or P4Python (pip
 
 # Perforce (Helix Core) Skill
 
-## Interface Selection
+## 0. Detect the Perforce MCP Server (do this first)
+
+Before falling back to the `p4` CLI or P4Python, **check whether the Perforce MCP
+Server is available in the current agent session**. When present, it exposes
+higher-level tools (`query_changelists`, `modify_changelists`, `query_reviews`,
+`modify_reviews`, `query_files`, `modify_files`, `query_streams`, `modify_streams`,
+`query_workspaces`, `modify_workspaces`, etc.) that should be **preferred over
+raw CLI/SDK calls** because they handle authentication, error mapping, and
+approval flows consistently.
+
+**Detection heuristic** (run from agent context, in this order):
+
+1. **Tool-list probe (most reliable)** — Inspect the available tool list for any
+   tool name matching `query_changelists`, `modify_changelists`, `query_shelves`,
+   `modify_shelves`, `query_files`, `modify_files`, `query_reviews`,
+   `modify_reviews`, `query_streams`, `modify_streams`, `query_workspaces`, or
+   `modify_workspaces`. If any of these are present, MCP is available —
+   regardless of how the server was named.
+2. **Server-name hint (advisory only)** — If your agent harness exposes MCP
+   server metadata, look for a name matching the patterns `p4*mcp*` or
+   `perforce*mcp*` (e.g., `p4mcp-server`, `perforce-p4-mcp`,
+   `p4-mcp-server`). Because the server name is user-configured, this is
+   informational only — always confirm with step 1.
+3. Optionally check the environment variable `P4_MCP_ENDPOINT` if your harness
+   sets one.
+
+**Interface preference order** when more than one is available:
+
+| Priority | Interface | When to use |
+|---|---|---|
+| 1 | **P4 MCP tools** | Always prefer when present — covers changelists, code review, file ops, stream workflows, workspace setup. |
+| 2 | **P4Python SDK** | Python agent context without MCP, or when MCP doesn't cover the operation (e.g., low-level admin). |
+| 3 | **`p4` CLI** | Shell scripts, one-off commands, or environments without Python/MCP. |
+
+> **Do not duplicate** what the MCP already provides. If `modify_changelists`
+> (create/submit/shelve), `modify_reviews`, `modify_files` (edit/add/delete/sync),
+> `modify_streams`, or `modify_workspaces` is available, use it instead of
+> shelling out to `p4`. Fall back to CLI/SDK only for capabilities the MCP does
+> not expose, or when the MCP is absent.
+
+See `references/mcp-integration.md` for the full MCP tool catalog and a mapping
+of each MCP skill area to the corresponding sections of this document.
+
+---
+
+## Interface Selection (fallback when MCP is unavailable)
 
 | Situation | Use |
 |---|---|
@@ -412,3 +457,6 @@ p4.run_streams()
 - `references/branching.md` — Deep dive on Streams vs. classic branch workflows,
   merge-down/copy-up patterns, and conflict resolution strategies. Read this for complex
   branching tasks.
+- `references/mcp-integration.md` — Catalog of the Perforce MCP Server's bundled
+  skills and tools, with a mapping showing which sections of this skill are
+  superseded by MCP tools when the MCP is available.
